@@ -14,15 +14,21 @@ class cutover (
     require => File['/tmp/chrismatteson-cutover/cutover.sh',"/tmp/chrismatteson-cutover/$uninstallver"],
   }
 
+  file { '/tmp/chrismatteson-cutover':
+    ensure => directory,
+  }
+
   file { '/tmp/chrismatteson-cutover/cutover.sh':
     ensure  => file,
     content => template('cutover/cutover.sh.erb'),
+    require => File['/tmp/chrismatteson-cutover'],
   }
 
   file { "/tmp/chrismatteson-cutover/$uninstallver":
     ensure  => directory,
     recurse => true,
     source  => "puppet:///cutover/$uninstallver",
+    require => File['/tmp/chrismatteson-cutover'],
   }
 
   exec { 'cutover':
