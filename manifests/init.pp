@@ -10,7 +10,7 @@ class cutover (
   }
 
   exec { 'create installer':
-    command => "/bin/echo 'curl -k https://$new_master:8140/packages/current/install.bash | sudo bash' | at now + 1 minutes",
+    command => "/bin/echo 'curl -k https://$new_master:8140/packages/current/install.bash | sudo bash' | at now + 2 minutes",
     require => File['/tmp/chrismatteson-cutover/cutover.sh',"/tmp/chrismatteson-cutover/$uninstallver"],
     cwd     => '/',
   }
