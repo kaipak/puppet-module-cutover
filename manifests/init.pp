@@ -29,9 +29,14 @@ class cutover (
     '3.3.1 (Puppet Enterprise 3.1.0)':  { $uninstallver='PE/3.1.0' }
     '3.3.3 (Puppet Enterprise 3.1.1)':  { $uninstallver='PE/3.1.1' }
     '3.3.3 (Puppet Enterprise 3.1.2)':  { $uninstallver='PE/3.1.2' }
-    '3.2.2 (Puppet Enterprise 3.1.3)':  { $uninstallver='PE/3.0.0' }
-    '3.2.2 (Puppet Enterprise 3.0.0)':  { $uninstallver='PE/3.0.0' }
-    '3.2.2 (Puppet Enterprise 3.0.0)':  { $uninstallver='PE/3.0.0' }
+    '3.3.3 (Puppet Enterprise 3.1.3)':  { $uninstallver='PE/3.1.3' }
+    '3.4.3 (Puppet Enterprise 3.2.0)':  { $uninstallver='PE/3.2.0' }
+    '3.4.3 (Puppet Enterprise 3.2.1)':  { $uninstallver='PE/3.2.1' }
+    '3.4.3 (Puppet Enterprise 3.2.2)':  { $uninstallver='PE/3.2.2' }
+    '3.4.3 (Puppet Enterprise 3.2.3)':  { $uninstallver='PE/3.2.3' }
+    '3.6.2 (Puppet Enterprise 3.3.0)':  { $uninstallver='PE/3.3.0' }
+    '3.6.2 (Puppet Enterprise 3.3.1)':  { $uninstallver='PE/3.3.1' }
+    '3.6.2 (Puppet Enterprise 3.3.2)':  { $uninstallver='PE/3.3.2' }
     '3.7.0 (Puppet Enterprise 3.7.0)':  { $uninstallver='PE/3.7.0' }
     '3.7.2 (Puppet Enterprise 3.7.1)':  { $uninstallver='PE/3.7.1' }
     '3.7.2 (Puppet Enterprise 3.7.2)':  { $uninstallver='PE/3.7.2' }

@@ -1,0 +1,2777 @@
+#! /bin/bash
+
+#==========================================================
+# Copyright @ 2014 Puppet Labs, LLC
+# Redistribution prohibited.
+# Address: 926 NW 13th Ave., Suite 210 / Portland, OR 97209
+# Phone: (877) 575-9775
+# Email: info@puppetlabs.com
+#
+# Please refer to the LICENSE.pdf file included
+# with the Puppet Enterprise distribution
+# for licensing information.
+#==========================================================
+
+#===[ Summary ]=========================================================
+
+# This program installs Puppet Enterprise. Run this file to start the
+# interactive installation or run with a "-h" option to display help.
+
+#===[ Conventions ]=====================================================
+
+# VARIABLES
+#
+# Variable names starting with "q_" are sanitized user answers to
+# questions asked by the `ask` function.
+#
+# Variable names starting with "t_" are transient variables for use
+# within a function. For example, "t_ask__name" is a transient variable
+# for storing a "name" within the "ask" function. This convention is
+# necessary because all POSIX sh variables are globals and there's no
+# way to localize the scope of variables to prevent functions from
+# stomping over each other's state.
+#
+# Variable names in all capital letters are globals that are
+# intentionally shared between different functions.
+#
+# This file can be sourced into a shell for use as a library.
+
+#===[ Global Varables ]================================================
+CONSOLE_PORT_OPTIONS="443,3000,3001,3002,3003,3004,3005"
+
+#===[ Functions ]=======================================================
+
+# Enqueue vendor packages based on user's answers...
+enqueue_vendor_packages() {
+    # NONPORTABLE
+    if [ "y" = "${q_puppet_cloud_install?}" -o "y" = "${q_database_install?}" ]; then
+      case "${PLATFORM_NAME?}" in
+        amazon | centos | rhel | sles)
+          enqueue_package 'libxslt'
+          ;;
+        debian | ubuntu)
+          enqueue_package 'libxslt1.1'
+          ;;
+      esac
+    fi
+
+    case "${PLATFORM_NAME?}" in
+      amazon | centos | rhel)
+        # pciutils are required for facter
+        enqueue_package 'pciutils'
+
+        # zlib is required for ruby
+        enqueue_package 'zlib'
+
+        enqueue_package 'which'
+        enqueue_package 'libxml2'
+        # dmidecode is required for facter, but not available on el4
+        case "${PLATFORM_RELEASE}" in
+          6)
+            enqueue_package 'dmidecode'
+            enqueue_package 'cronie'
+            ;;
+          5)
+            enqueue_package 'dmidecode'
+            enqueue_package 'vixie-cron'
+            ;;
+        esac
+
+        enqueue_package 'net-tools'
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppetdb_install?}" ]; then
+          enqueue_package 'libjpeg'
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+          enqueue_package 'curl'
+          enqueue_package 'system-logos'
+          # JJM mailcap is required for /etc/mime.types
+          # In both RHEL x5 and x6
+          enqueue_package 'mailcap'
+        fi
+        ;;
+      sles)
+        # pciutils and pmtools are required for facter
+        enqueue_package 'pmtools'
+        enqueue_package 'pciutils'
+        enqueue_package 'cron'
+        enqueue_package 'net-tools'
+        enqueue_package 'libxml2'
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppetdb_install?}" ]; then
+          enqueue_package 'libjpeg'
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+          enqueue_package 'libapr1'
+          enqueue_package 'curl'
+          enqueue_package 'libapr-util1'
+        fi
+        ;;
+      ubuntu | debian | cumulus)
+        # pciutils and dmidecode are required for facter, except on powerpc which has no dmidecode
+        enqueue_package 'pciutils'
+        if [ "${PLATFORM_NAME?}" = "ubuntu" ] || [ "${PLATFORM_NAME?}" = "debian" ] ; then
+            enqueue_package 'dmidecode'
+        fi
+
+        enqueue_package 'hostname'
+        enqueue_package 'cron'
+        enqueue_package 'libldap-2.4-2'
+        enqueue_package 'libreadline5'
+        enqueue_package 'libxml2'
+
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppetdb_install?}" ]; then
+          enqueue_package 'libjpeg62'
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+          enqueue_package 'file'
+          enqueue_package 'libmagic1'
+          enqueue_package 'libpcre3'
+          enqueue_package 'curl'
+          enqueue_package 'perl'
+          enqueue_package 'mime-support'
+          enqueue_package 'libapr1'
+          enqueue_package 'libcap2'
+          enqueue_package 'libaprutil1'
+          if [ ubuntu =  "${PLATFORM_NAME?}" ]; then
+            enqueue_package 'libaprutil1-dbd-sqlite3'
+            enqueue_package 'libaprutil1-ldap'
+          elif [ debian = "${PLATFORM_NAME?}" ]; then
+            enqueue_package 'libaprutil1-dbd-sqlite3'
+            enqueue_package 'libaprutil1-ldap'
+          fi
+        fi
+        ;;
+      solaris)
+        if [ "${PLATFORM_RELEASE?}" = "11" ] ; then
+          enqueue_package 'system/library/gcc-45-runtime'
+          enqueue_package 'library/readline'
+          enqueue_package 'library/security/openssl'
+        fi
+        # There are no vendor packages to install on Solaris 10
+        ;;
+      aix | eos)
+        # No vendor packages
+        :
+        ;;
+      *)
+        display_failure "Do not know how to install vendor packages on this platform."
+        ;;
+    esac
+}
+
+# Install or upgrade all modules to /opt/puppet/share/puppet/modules
+#
+# Arguments: Whether it is an install or upgrade. Defaults to install
+install_puppet_modules() {
+    # Save our current working directory.
+    pushd "${INSTALLER_DIR}" &>/dev/null
+    local t_install_dir="$(pwd)"
+    t_module_target_dir="/opt/puppet/share/puppet/modules"
+    t_module_backup_file="/opt/puppet/share/puppet/module.upgrade.backup.tar"
+    if ! is_noop; then
+        pushd ${t_module_target_dir} &>/dev/null
+        if run_suppress_output "ls ${t_module_target_dir}/* &> /dev/null"; then
+            # Backup current modules for recovery
+            run_suppress_stdout "tar cf ${t_module_backup_file} ${t_module_target_dir}/*"
+
+            # Check module whitelist
+            if [ -f "${t_install_dir?}/modules/whitelist_modules.txt" ] ; then
+                t_whitelist_modules=$( cat "${t_install_dir?}/modules/whitelist_modules.txt" )
+            fi
+            t_remove_modules=`ls "${t_module_target_dir}"`
+            for t_whitelist_module in ${t_whitelist_modules} ;
+            do
+                t_remove_modules=`echo ${t_remove_modules?} | sed "/\b${t_whitelist_module?}\b/d"`
+            done
+
+            # Remove non-whitelist modules
+            for t_remove_module in ${t_remove_modules?} ;
+            do
+                run_suppress_stdout "rm -rf ${t_remove_module?}"
+            done
+        fi
+        for module_pkg in $( cat "${t_install_dir?}/modules/install_modules.txt" );
+        do
+            if [ -e "${t_install_dir?}/modules/${module_pkg}"* ]; then
+                cur_mod_pkg=`ls "${t_install_dir?}/modules/${module_pkg?}"*`
+                # Install module
+                # --force is present to ensure we overwrite modules we control
+                run_suppress_stdout '/opt/puppet/bin/puppet module install "'"${cur_mod_pkg}"'" --force --ignore-dependencies --modulepath /opt/puppet/share/puppet/modules'
+            fi
+        done
+        # If there was a puppet-module symlink in ${PLATFORM_SYMLINK_TARGET}, remove it
+        run_suppress_output "rm -f ${PLATFORM_SYMLINK_TARGET}/puppet-module"
+
+        # Pop back to $INSTALLER_DIR
+        popd &>/dev/null
+    fi
+    # Pop back to original $PWD
+    popd &>/dev/null
+    run_suppress_stdout "chown ${PLATFORM_PUPPET_USER}:${PLATFORM_PUPPET_GROUP} -R ${t_module_target_dir?}"
+}
+
+
+# Configure mcollective on a puppet master
+# This is a really weird way to do it, but as long
+# as the module is installed correctly and the facts
+# are defined correctly it will "just work"
+configure_mcollective_master() {
+    display "Generating mcollective password..."
+    gen_password "/etc/puppetlabs/mcollective/credentials"
+    run_suppress_stdout "chown ${PLATFORM_PUPPET_USER}:${PLATFORM_PUPPET_GROUP} /etc/puppetlabs/mcollective/credentials"
+    run_suppress_stdout "chmod 600 /etc/puppetlabs/mcollective/credentials"
+    display "Running puppet apply to configure MCollective ..."
+    t_mcollective_roles="pe_mcollective::role::master,pe_mcollective::role::agent"
+    if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        t_mcollective_roles="${t_mcollective_roles},pe_mcollective::role::console"
+    fi
+    run_suppress_stdout "/opt/puppet/bin/puppet apply --no-report --modulepath /opt/puppet/share/puppet/modules -v --exec 'include ${t_mcollective_roles?}'"
+    display "MCollective configuration is complete ..."
+}
+
+# Configure auth.conf for certificate manager on the master
+# This will also be in the default group, but this ensures it is ready after install
+configure_certificate_manager() {
+    display "Setting up auth.conf..."
+    run_suppress_stdout "/opt/puppet/bin/puppet apply --no-report --modulepath /opt/puppet/share/puppet/modules -v --exec 'class { request_manager: }'"
+    display "auth.conf updated."
+}
+
+configure_postgresql_server() {
+    display "Configuring postgresql server..."
+    run "mkdir -p /opt/puppet/var/lib/pgsql/9.2"
+
+    # For fresh installs or upgrades from 2.8 (in which case we're installing
+    # postgres), make shmmax big enough. For upgrades from 3.x, presumably
+    # everything is already working so we'll just leave it alone.
+    if !(is_upgrade && is_PE_x_or_greater '3'); then
+        t_postgres_memory_mb="$(/opt/puppet/bin/facter memorysize_mb)"
+        t_postgres_shmmax_req="$((${t_postgres_memory_mb%.*} * 1024 * 1024 / 2))"
+        t_postgres_shmmax_avail="$(/sbin/sysctl kernel.shmmax | awk '{ printf $3 }')"
+
+        # Set kernel.shmmax to half the available memory size if it's less than that
+        if [ "${t_postgres_shmmax_req?}" -gt ${t_postgres_shmmax_avail?} ]; then
+            run_suppress_stdout "/sbin/sysctl kernel.shmmax=${t_postgres_shmmax_req?}"
+            run_suppress_stdout "/opt/puppet/bin/puppet apply --exec \"ini_setting { 'kernel.shmmax': path => '/etc/sysctl.conf', section => '', setting => 'kernel.shmmax', value => '${t_postgres_shmmax_req?}' }\""
+        fi
+
+    fi
+
+    run_suppress_stdout "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/postgresql_server.pp.erb' | /opt/puppet/bin/puppet apply --no-report --modulepath=/opt/puppet/share/puppet/modules -v" 
+    display "PostgreSQL server configured."
+    pgs_configured="true"
+}
+
+configure_puppetdb() {
+    display "Configuring puppetdb..."
+    if [ y = "${q_puppetdb_install?}" ]; then
+        enqueue_package 'pe-puppetdb'
+    fi
+    if [ y = "${q_puppetmaster_install?}" ]; then
+        enqueue_package 'pe-puppetdb-terminus'
+    fi
+    install_queued_packages
+
+    #Add required paths so that psql would be launchable by the module
+    if [ y = "${q_puppetdb_install?}" ]; then
+        run_suppress_stdout "/opt/puppet/sbin/puppetdb ssl-setup -f"
+        # XXX Classify this parameter in the console, when console is remote (use hostname).
+        run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/puppetdb.pp.erb' | PATH=/opt/puppet/bin:$PATH LD_LIBRARY_PATH=/opt/puppet/lib puppet apply --no-report --modulepath=/opt/puppet/share/puppet/modules"
+    fi
+    # We need to configure the master to talk to PuppetDB.
+    if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        # XXX Classify these parameters in the console!
+        run_suppress_stdout "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/puppetdb_master.pp.erb' | /opt/puppet/bin/puppet apply --no-report --modulepath=/opt/puppet/share/puppet/modules --certname=${q_puppetmaster_certname?}"
+    fi
+
+    if [ n = "${q_puppetmaster_install?}" -a y = ${q_puppetdb_install?} ]; then
+      #Run puppet agent once more, this time without the --no-op option since the pe-puppetdb package is already present
+      run_suppress_stdout "/opt/puppet/bin/puppet agent --test --color=false || true"
+    fi
+
+    display "PuppetDB configured."
+}
+
+configure_puppetdb_classes() {
+    display "Configuring classes and groups for PuppetDB node..."
+
+    add_console_node ${q_puppetdb_hostname?}
+
+    add_console_class "pe_puppetdb::pe"
+    add_console_class_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe"
+
+    add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "listen_port" "${q_puppetdb_plaintext_port?}"
+    add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "ssl_listen_address" "${q_puppetdb_hostname?}"
+    add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "ssl_listen_port" "${q_puppetdb_port?}"
+    add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "database_host" "${q_database_host?}"
+    add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "database_port" "${q_database_port?}"
+    add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "database_name" "${q_puppetdb_database_name?}"
+    add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "database_username" "${q_puppetdb_database_user?}"
+
+    if [ 'y' = "${q_pe_database}" ]; then
+        add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "manage_database" "true"
+    else
+        add_console_classparam_to_node ${q_puppetdb_hostname?} "pe_puppetdb::pe" "manage_database" "false"
+    fi
+
+    display "Configuration of classes and groups for PuppetDB node was enqueued..."
+}
+
+configure_puppetdb_master_classes() {
+    display "Configuring classes and groups for PuppetDB master node..."
+
+    add_console_node ${q_puppetagent_server?}
+
+    add_console_group "puppet_master"
+    add_console_group_to_node ${q_puppetagent_server?} "puppet_master"
+
+    add_console_class "pe_puppetdb::master::config"
+    add_console_class_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config"
+
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "puppetdb_server" "${q_puppetdb_hostname?}"
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "puppetdb_port" "${q_puppetdb_port?}"
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "manage_config" "true"
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "manage_routes" "true"
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "manage_storeconfigs" "true"
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "manage_report_processor" "true"
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "enable_reports" "true"
+    add_console_classparam_to_node ${q_puppetagent_server?} "pe_puppetdb::master::config" "strict_validation" "false"
+
+    display "Configuration of classes and groups for PuppetDB master node was enqueued..."
+}
+
+configure_pe_repo_classes() {
+    display "Configuring classes for package repositories..."
+
+    add_console_node ${q_puppetagent_server?}
+
+    add_console_class "pe_repo"
+    add_console_class_to_node ${q_puppetagent_server?} "pe_repo"
+
+    add_console_class "pe_repo::platform::$(platform_puppet_class)"
+    add_console_class_to_node ${q_puppetagent_server?} "pe_repo::platform::$(platform_puppet_class)"
+
+    # If they've set a tarball server (via answer file if this is split
+    # install), use it. Otherwise leave it unset to use the default.
+    if [ -n "${q_tarball_server}" ]; then
+        add_console_classparam_to_node ${q_puppetagent_server?} "pe_repo" "base_path" ${q_tarball_server?}
+    fi
+
+    display "Configuration of package repository classes was enqueued..."
+}
+
+remove_pe_compliance_class() {
+    # For a console upgrade from a version < 3.2, we need to remove the
+    # pe_compliance class, which may have been leftover from a 2.8 upgrade.
+    # However, it may not *necessarily* exist, and because of how we batch rake
+    # tasks, checking for it is relatively expensive. So instead, we add it, to
+    # make sure we can then delete it.
+    if is_upgrade && [ y = "${q_puppet_enterpriseconsole_install?}" ] && [[ "${CURRENT_PE_MAJOR}.${CURRENT_PE_MINOR}" < "3.2" ]]; then
+        add_console_class "pe_compliance"
+        del_console_class "pe_compliance"
+    fi
+}
+
+configure_license_class() {
+    display "Configuring license class for the console..."
+
+    add_console_node "${q_puppetagent_certname?}"
+    add_console_class "puppet_enterprise::license"
+    add_console_class_to_node "${q_puppetagent_certname?}" "puppet_enterprise::license"
+}
+
+# High level function classifies both the console and master with the appropriate subclasses of the pe_mcollective module
+# so that they can be set up correctly.
+classify_mcollective_roles() {
+    display "Configuring nodes, classes and groups for mcollective..."
+    master_node=${q_puppetagent_server?}
+    console_node=${q_puppetagent_certname?}
+
+    # Create console and master classes, group, add classes to groups.
+    for role in master console; do
+        t_cur_node="${role}_node"
+        add_console_class "pe_mcollective::role::${role}"
+        add_console_group "puppet_${role}"
+        add_console_class_to_group "pe_mcollective::role::${role}" "puppet_${role}"
+        add_console_node ${!t_cur_node}
+        add_console_group_to_node ${!t_cur_node} "puppet_${role}"
+    done
+
+    display "Configuration of nodes, classes and groups for mcollective was enqueued..."
+
+    display "Configuring Puppet console database prune cron job..."
+    add_console_class "pe_console_prune"
+    if ! is_upgrade; then
+        # Add the pe_console_prune class to the puppet_console group but only on new
+        # installs as we don't want to surprise the user by pruning the DB without
+        # notice within a day after an upgrade.
+        add_console_class_to_group "pe_console_prune" "puppet_console"
+        add_console_classparam_to_group "puppet_console" "pe_console_prune" "prune_upto" "30"
+    fi
+    display "Configuration of Puppet console database prune cron job was enqueued..."
+}
+
+# Setup a package repo on the master for the platform we're currently installing on
+setup_package_repo() {
+    display_comment "Setting up agent package repository for ${PLATFORM_TAG}"
+    export t_pe_repo_puppet_class="$(platform_puppet_class)"
+
+    # The pe_repo module wants to make a symlink to an extracted tarball, so we
+    # have to mimic the structure of an extracted tarball.
+    t_pe_repo_basename="puppet-enterprise-${PE_VERSION?}-${PLATFORM_TAG?}-agent"
+    t_pe_repo_agent_package_dir="/opt/puppet/packages/public/${t_pe_repo_basename?}/agent_packages"
+    run "mkdir -p '${t_pe_repo_agent_package_dir?}'"
+    run "cp -R '$(agent_package_dir)' '${t_pe_repo_agent_package_dir?}'"
+    run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/pe_repo.pp.erb' | /opt/puppet/bin/puppet apply --no-report --modulepath=/opt/puppet/share/puppet/modules"
+}
+
+# Simple listing of cloud gems that get enqueued
+# on many platforms (EL5, EL6, SLES11, lucid, squeeze, precise, wheezy)
+#
+handle_cloud() {
+    enqueue_package 'pe-cloud-provisioner'
+    enqueue_package 'pe-cloud-provisioner-libs'
+    # This is now being enqueued for all el, sles, deb and ubuntu installs so is no longer needed here.
+    # enqueue_package 'pe-rubygem-net-ssh'
+}
+
+# Enqueue installer environment
+enqueue_installer_packages() {
+    case "${PLATFORM_NAME?}" in
+        amazon | centos | rhel)
+            # zlib is required for ruby
+            enqueue_package 'zlib'
+            ;;
+    esac
+
+    enqueue_package 'pe-ruby'
+    enqueue_package 'pe-bundler'
+    enqueue_package 'pe-installer'
+}
+
+enqueue_agent_packages() {
+    case "${PLATFORM_NAME?}" in
+        amazon | centos | rhel | sles | ubuntu | debian | cumulus | eos)
+            t_el_4_regex="el-4-(i386|x86_64)"
+            if [[ $PLATFORM_TAG =~ ${t_el_4_regex?} ]] || [ "${PLATFORM_TAG}" = "eos-4-i386" ]; then
+                enqueue_package 'pe-puppet-enterprise-release'
+                enqueue_package 'pe-libyaml'
+                enqueue_package 'pe-virt-what'
+                enqueue_package 'pe-ruby'
+                enqueue_package 'pe-ruby-shadow'
+                enqueue_package 'pe-ruby-stomp'
+                enqueue_package 'pe-mcollective-common'
+                enqueue_package 'pe-mcollective'
+                enqueue_package 'pe-facter'
+                enqueue_package 'pe-puppet'
+                enqueue_package 'pe-augeas'
+                enqueue_package 'pe-ruby-augeas'
+                enqueue_package 'pe-hiera'
+                enqueue_package 'pe-ruby-rgen'
+                enqueue_package 'pe-rubygem-deep-merge'
+                enqueue_package 'pe-openssl'
+            else
+                enqueue_package 'pe-agent'
+            fi
+            # pe-ruby-ldap and pe-rubygem-net-ssh are not built for agent only installs
+            if [ "false" = "${CLIENT_ONLY?}" ]; then
+                enqueue_package 'pe-ruby-ldap'
+                enqueue_package 'pe-rubygem-net-ssh'
+            fi
+            ;;
+        aix)
+            enqueue_package 'pe-puppet-enterprise-release'
+            enqueue_package 'pe-augeas'
+            enqueue_package 'pe-libyaml'
+            enqueue_package 'pe-openssl'
+            enqueue_package 'pe-ruby'
+            enqueue_package 'pe-ruby-augeas'
+            enqueue_package 'pe-ruby-stomp'
+            enqueue_package 'pe-ruby-rgen'
+            enqueue_package 'pe-rubygem-deep-merge'
+            enqueue_package 'pe-hiera'
+            enqueue_package 'pe-facter'
+            enqueue_package 'pe-mcollective'
+            enqueue_package 'pe-mcollective-common'
+            enqueue_package 'pe-puppet'
+            ;;
+
+        solaris)
+            case "${PLATFORM_RELEASE?}" in
+                10)
+                    enqueue_package 'PUPpuppet-enterprise-release'
+                    enqueue_package 'PUPlibyaml'
+                    enqueue_package 'PUPruby'
+                    enqueue_package 'PUPopenssl'
+                    enqueue_package 'PUPstomp'
+                    enqueue_package 'PUPmcollective'
+                    enqueue_package 'PUPfacter'
+                    enqueue_package 'PUPpuppet'
+                    enqueue_package 'PUPhiera'
+                    enqueue_package 'PUPruby-augeas'
+                    enqueue_package 'PUPaugeas'
+                    enqueue_package 'PUPruby-rgen'
+                    enqueue_package 'PUPdeep-merge'
+                    ;;
+                11)
+                    enqueue_package 'pe-puppet-enterprise-release'
+                    enqueue_package 'pe-augeas'
+                    enqueue_package 'pe-libyaml'
+                    enqueue_package 'pe-ruby'
+                    enqueue_package 'pe-ruby-shadow'
+                    enqueue_package 'pe-ruby-augeas'
+                    enqueue_package 'pe-stomp'
+                    enqueue_package 'pe-ruby-rgen'
+                    enqueue_package 'pe-deep-merge'
+                    enqueue_package 'pe-hiera'
+                    enqueue_package 'pe-facter'
+                    enqueue_package 'pe-mcollective'
+                    enqueue_package 'pe-puppet'
+                    ;;
+                *)
+                    display_failure "Do not know how to install on Solaris ${PLATFORM_RELEASE}"
+                    ;;
+            esac
+            ;;
+        *)
+            display_failure "Do not know how to install Ruby or Puppet on this platform"
+            ;;
+    esac
+}
+
+query_about_master_connectivity() {
+    t_qamc__msg="Puppet Master at '${q_puppetagent_server}:8140' could not be reached."
+
+    # fail if the answer file tells us to
+    if [ 'y' == "${q_fail_on_unsuccessful_master_lookup}" ]; then
+        display_failure "${t_qamc__msg} Aborting installation as directed by answer file. Set 'q_fail_on_unsuccessful_master_lookup' to 'n' if installation should continue despite communication failures."
+    elif [ 'n' == "${q_fail_on_unsuccessful_master_lookup}" -a 'y' == "${IS_ANSWER_REQUIRED}" ]; then
+        break
+    fi
+
+    ask q_continue_or_reenter_master_hostname "The installer couldn’t reach the puppet master server at ${q_puppetagent_server}. If this server name is correct, please check your DNS configuration to ensure the puppet master node can be reached by name, and make sure your firewall settings allow traffic on port 8140. Enter ‘r’ if you need to re-enter the puppet master’s name; otherwise, enter ‘c’ to continue." cr
+    if [ 'c' == "${q_continue_or_reenter_master_hostname}" ]; then
+        break
+    else
+        unset q_puppetagent_server
+        ask q_puppetagent_server "Puppet master hostname to connect to?" String 'puppet'
+    fi
+    unset q_continue_or_reenter_master_hostname
+}
+
+# Generate global Passenger configuration
+generate_global_passenger_conf() {
+    pool_size=$(get_passenger_pool_size)
+    let max_per_app=($pool_size/2)
+
+    #...[ passenger-extra.conf ]............................................
+
+    filebuffer_clear
+    filebuffer_append \
+"PassengerHighPerformance on
+PassengerMaxRequestQueueSize 0
+PassengerMaxRequests 40
+PassengerPoolIdleTime 15
+PassengerMaxPoolSize ${pool_size}"
+    if [ y = "${q_puppetmaster_install?}" -a y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        filebuffer_append "PassengerMaxInstancesPerApp ${max_per_app}"
+    fi
+    filebuffer_write "/etc/puppetlabs/httpd/conf.d/passenger-extra.conf"
+}
+
+cron_enable() {
+    case "${PLATFORM_NAME?}" in
+        amazon | centos | rhel | eos )
+            enable_service 'crond'
+            bounce_service 'crond'
+            ;;
+        debian | ubuntu | sles | cumulus)
+            enable_service 'cron'
+            bounce_service 'cron'
+            ;;
+        solaris)
+            run_suppress_stdout "/usr/sbin/svcadm enable svc:/system/cron:default"
+            ;;
+        aix)
+            if ! /usr/sbin/lsitab "cron" > /dev/null; then
+                run_suppress_stdout '/usr/sbin/mkitab "cron:23456789:respawn:/usr/sbin/cron"'
+            fi
+            ;;
+    esac
+}
+
+# Utility function to re-query the user regarding an unavailable
+# value for a database variable, e.g. a db name that is in use already
+# Ask twice, then fail.
+# Arguments:
+# 1. The value of the resource to check for, e.g. console_auth
+# 2. A string, one of either "user" or "db" to flag *which* kind of resource to check
+# 3. The variable that the value should be assigned to
+# 4. An optional message string to display to the user in the ask message
+# 5. An optional failure message to display
+requery_db_resource_value() {
+    t_success="n"
+    t_count=0
+    t_value="${1?}"
+    t_type="${2?}"
+    t_variable="${3?}"
+    t_message="${4}"
+    t_fail_message="${5}"
+    while [ "n" = "${t_success}" ] && [ ${t_count} -lt 2 ] ; do
+        unset "${t_variable}"
+        if [ -z "${t_message}" ] ; then
+            ask ${t_variable} "The ${t_type} name (${t_value}) for this host already exists on the PostgreSQL server. Please enter an unused ${t_type} name?" String
+        else
+            ask ${t_variable} "${t_message}" String
+        fi
+        eval t_value="${!t_variable}"
+        if is_db_name_available "${t_value}" "${t_type}" ; then
+            t_success="y"
+        fi
+        t_count=$(($t_count + 1))
+    done
+    if [ "n" = "${t_success}" ] ; then
+        # We tried twice, and failed. Fail hard.
+        if [ -z "${t_fail_message}" ] ; then
+            display_failure "Unable to create the ${t_type} with the name ${t_value}, ${t_type} already exists on the PostgreSQL server."
+        else
+            display_failure "${t_fail_message}"
+        fi
+    fi
+}
+
+# Wait for the database server to be up and running. This is used so that we
+# don't try to verify the database until the server is ready to accept
+# connections. This is only done on database installs. $1 is the number of
+# connection attempts to make. Returns 0 if the database is running, and 1 if
+# the maximum number of attempts is reached.
+wait_for_db() {
+    t_wait_for_db_max_retries="${1?}"
+    t_wait_for_db_tries=0
+
+    [ y = "${q_database_install?}" ] || return 0;
+
+    while [ "${t_wait_for_db_tries?}" -lt "${t_wait_for_db_max_retries?}" ]; do
+        if eval "su - ${q_database_root_user} -c \"${t_path_to_psql?} --command='\l'\" -s /bin/bash" &> /dev/null; then
+            return 0
+        else
+            sleep 0.5
+            t_wait_for_db_tries=$(expr "${t_wait_for_db_tries?}" + 1)
+        fi
+    done
+
+    return 1
+}
+
+
+# Wait for PuppetDB to be up and running.
+# This is only done on all-in-one installs. $1 is the number of
+# connection attempts to make. Returns 0 if the database is running, and 1 if
+# the maximum number of attempts is reached.
+wait_for_puppetdb() {
+    is_noop && return 0
+    t_wait_for_puppetdb_max_retries="${1?}"
+    t_wait_for_puppetdb_tries=0
+    t_wait_for_puppetdb_url="https://${q_puppetdb_hostname}:${q_puppetdb_port}"
+
+    while [ "${t_wait_for_puppetdb_tries?}" -lt "${t_wait_for_puppetdb_max_retries?}" ]; do
+        run_suppress_stdout "curl -s ${t_wait_for_puppetdb_url}"
+        t_contact_puppetdb_exit_status=$?
+        # These are both known SSL failures which mean the service is up and listening.
+        # Since we're not using any known certs, we expect to be able to connect and then have an SSL failure.
+        # 35     SSL connect error. The SSL handshaking failed.
+        # 60     Peer certificate cannot be authenticated with known CA certificates.
+        case $t_contact_puppetdb_exit_status in
+            35 | 60)
+                return 0
+                ;;
+            *)
+                sleep 1
+                t_wait_for_puppetdb_tries=$(expr "${t_wait_for_puppetdb_tries?}" + 1)
+                ;;
+        esac
+    done
+
+    return 1
+
+}
+
+# Verify a single database on the database server.
+# The arguments to this function are the database, username, and password to
+# verify.
+verify_single_database() {
+    t_verify_database="${1?}"
+    t_verify_user="${2?}"
+    t_verify_password="${3?}"
+
+    create_db_encoding="ENCODING 'utf8' LC_CTYPE 'en_US.utf8' LC_COLLATE 'en_US.utf8' template template0"
+    t_psql_remote_string="--host='${q_database_host?}' --port=${q_database_port?}"
+
+    t_db_setup=0
+
+    if ! output=$(run "PGPASSWORD='${t_verify_password?}' ${t_path_to_psql?} --username='${t_verify_user?}' ${t_psql_remote_string} --dbname='${t_verify_database?}' --command='\dT' 2>&1"); then
+        if echo $output | egrep -q "role \"${t_verify_user?}\" does not exist" ; then
+            echo "Could not connect to the postgresql server using the user: ${t_verify_user?}. Please log in as a privileged user and set it up manually. Example SQL commands:" | display_wrapped_text
+            display_newline
+            printf -- '%s' "
+            CREATE USER \"${t_verify_user}\" PASSWORD '${t_verify_password?}';
+            "
+        elif echo $output | egrep -q "database \"${t_verify_database?}\" does not exist" ; then
+            echo "Could not connect to postgresql server using database: ${t_verify_database?} with user: ${t_verify_user?}. Please log in as a privileged user and set it up manually. Example SQL commands:" | display_wrapped_text
+            display_newline
+            printf -- '%s' "
+            CREATE DATABASE \"${t_verify_database}\" OWNER \"${t_verify_user}\" ${create_db_encoding?};
+            "
+        else
+            echo "Could not connect to postgres server using the user: ${t_verify_user?} and database: ${t_verify_database?}. Please log in as a privileged user and set up the user or database manually. Example SQL commands:" | display_wrapped_text
+            display_newline
+            printf -- '%s' "
+            CREATE USER \"${t_verify_user}\" PASSWORD '${t_verify_password?}';
+            CREATE DATABASE \"${t_verify_database}\" OWNER \"${t_verify_user}\" ${create_db_encoding?};
+            "
+        fi
+        display_newline
+
+        t_db_setup=1
+    fi
+}
+
+# verify_postgresql: there are two basic cases
+# 1) we are verifying a root user
+# 2) we are verifying existing credentials and databases
+#
+# The first and only argument represents which databases to verify: console,
+# puppetdb or all.
+#
+# The function uses several installer variables including:
+# - q_database_install
+# - q_database_host
+# - q_database_port
+# - q_database_root_user
+# - q_puppet_enterpriseconsole_database_name
+# - q_puppet_enterpriseconsole_database_user
+# - q_puppet_enterpriseconsole_database_password
+# - q_puppet_enterpriseconsole_auth_database_name
+# - q_puppet_enterpriseconsole_auth_database_user
+# - q_puppet_enterpriseconsole_auth_database_password
+# - q_puppetdb_database_name
+# - q_puppetdb_database_user
+# - q_puppetdb_database_password
+# - t_path_to_psql
+#
+# It returns 0 for success if the databases/users exist or the root account is valid
+# and non-zero for failure if those databases/users don't exist or the root account is invalid
+
+verify_postgresql() {
+    t_db_setup=0
+
+    # If we are doing the setup, we need to verify that the root account credentials are good.
+    if [ y = "${q_database_install?}" ]; then
+        if ! eval "su - ${q_database_root_user} -c \"${t_path_to_psql?} --command='\l'\" -s /bin/bash" &> /dev/null; then
+            display_failure "Could not connect to the postgresql server using the ${q_database_root_user} user."
+        fi
+    elif !(is_upgrade && is_PE_x_or_greater '3'); then
+        # If we aren't doing the setup, we need to verify that the console and PuppetDB account credentials are good and the databases exist.
+        # We check each in turn and give example SQL commands for each block upon failure. We don't fail hard on error until the function returns,
+        # so all five blocks can display errors to the user.
+
+        # First we check that the console user exists and that we can connect to the console database using the console user credentials.
+        if [ 'all' = ${1?} -o 'console' = ${1?} ]; then
+            if ! verify_single_database "${q_puppet_enterpriseconsole_database_name?}" "${q_puppet_enterpriseconsole_database_user?}" "${q_puppet_enterpriseconsole_database_password?}"; then
+                t_db_setup=1
+            fi
+
+            if ! verify_single_database "${q_puppet_enterpriseconsole_auth_database_name?}" "${q_puppet_enterpriseconsole_auth_database_user?}" "${q_puppet_enterpriseconsole_auth_database_password?}"; then
+                t_db_setup=1
+            fi
+        fi
+
+        if [ 'all' = "${1?}" -o 'puppetdb' = "${1?}" ]; then
+            if ! verify_single_database "${q_puppetdb_database_name?}" "${q_puppetdb_database_user?}" "${q_puppetdb_database_password?}"; then
+                t_db_setup=1
+            fi
+        fi
+    fi
+
+    return ${t_db_setup?}
+}
+
+# Verify the db credentials, as well as the console db if we're installing the
+# console.
+verify_db() {
+    display_comment "Verifying postgresql credentials..."
+    if [ y = "${q_puppetdb_install?}" ]; then
+        if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            t_verify_dbs='all'
+        else
+            t_verify_dbs='puppetdb'
+        fi
+    elif [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        t_verify_dbs='console'
+    fi
+
+    if ! verify_postgresql "${t_verify_dbs?}"; then
+        display_failure "The provided postgresql credentials could not be verified. Please follow the above instructions and try again."
+    fi
+}
+
+# Warn about needed open ports
+warn_open_ports() {
+    t_inbound_port_string=""
+    t_outbound_port_string=""
+
+    # Add 443 for HTTPS connections if the console is being installed...
+    # ... inbound if it's a console install...
+    if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+      t_inbound_port_string="${t_inbound_port_string?}${q_puppet_enterpriseconsole_httpd_port?}, "
+    fi
+    # ... outbound if it's a puppetmaster install and not a standalone install
+    if [ y = "${q_puppetmaster_install?}" -a ! y = "${q_all_in_one_install?}" ]; then
+      t_outbound_port_string="${t_outbound_port_string?}${q_puppetmaster_enterpriseconsole_port?}, "
+    fi
+
+    # Add 8140 for the puppetmaster and 61613 for mcollective/stomp/activemq...
+    # ... inbound if it's a master install...
+    if [ y = "${q_puppetmaster_install?}" ]; then
+      t_inbound_port_string="${t_inbound_port_string?}8140, 61613, "
+    else
+      # ... otherwise outbound
+      t_outbound_port_string="${t_outbound_port_string?}8140, 61613, "
+    fi
+
+    # Add 5432 for Postgres...
+    # ... inbound if it's a non-console database install...
+    if [ y = "${q_database_install?}" -a ! y = "${q_puppet_enterpriseconsole_install?}" ]; then
+      t_inbound_port_string="${t_inbound_port_string?}${q_database_port?}, "
+    fi
+    # ... outbound on a non-database PuppetDB or console install
+    if [ ! y = "${q_database_install?}" ] && [ y = "${q_puppetdb_install}" -o y = "${q_puppet_enterpriseconsole_install}" ]; then
+      t_outbound_port_string="${t_outbound_port_string?}${q_database_port?}, "
+    fi
+
+    # Add 8081 for PuppetDB if not a standalone install...
+    if [ ! y = "${q_all_in_one_install?}" ]; then
+      # ... inbound if it's a PuppetDB install
+      if [ y = "${q_puppetdb_install?}" ]; then
+        t_inbound_port_string="${t_inbound_port_string?}${q_puppetdb_port?}, "
+      fi
+      # ... outbound if it's a puppetmaster or console install
+      if [ y = "${q_puppetmaster_install}" ]; then
+        t_outbound_port_string="${t_outbound_port_string?}${q_puppetdb_port?}, "
+      fi
+    fi
+
+    if [ -n "${t_inbound_port_string?}" ]; then
+        echo "If you have a firewall running, please ensure the following TCP ports are open: ${t_inbound_port_string%, }" | display_wrapped_text
+        display_newline
+    fi
+
+    if [ -n "${t_outbound_port_string?}" ]; then
+        echo "If you have a firewall running, please ensure outbound connections to are allowed via the following TCP ports: ${t_outbound_port_string%, }" | display_wrapped_text
+        display_newline
+    fi
+
+}
+
+#===[ Main ]============================================================
+
+. "$(dirname "${0?}")/utilities"
+
+# Version variables to use when creating links and printing messages.
+PE_VERSION=$(cat "$(dirname "${0?}")/VERSION" 2> /dev/null)
+PE_LINK_VER=$(echo ${PE_VERSION?} | cut -d '.' -f1,2)
+
+if [ "puppet-enterprise-installer" = "$(basename "${0?}")" ]; then
+
+    #---[ Environment ]-----------------------------------------------------
+
+    # Installing via sudo may not add required path components
+    PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin
+
+    #---[ Paranoia ]--------------------------------------------------------
+
+    # Exit immediately if a simple command exits with a non-zero status:
+    set -e
+
+    #---[ Prepare ]---------------------------------------------------------
+
+    # Catch CTRL-C and "set -e" errors:
+    register_exception_handler
+
+    # Setup "PLATFORM_*" variables:
+    prepare_platform
+
+    #---[ Process command-line options ]------------------------------------
+
+    ANSWER_FILE_TO_LOAD=
+    ANSWER_FILE_TO_SAVE=
+    IS_ANSWER_REQUIRED=n
+    LOGFILE=
+    IS_NOOP=n
+    IS_DEBUG=n
+    IS_VERBOSE_DEBUG=n
+    IS_SAVE_ANSWERS=n
+    IS_SUPPRESS_OUTPUT=n
+    IS_UPGRADE=n
+
+    while getopts a:A:Dhl:nqs:V name; do
+        case "$name" in
+            a)
+                ANSWER_FILE_TO_LOAD="${OPTARG?}"
+                IS_ANSWER_REQUIRED=y
+                ;;
+            A)
+                ANSWER_FILE_TO_LOAD="${OPTARG?}"
+                IS_ANSWER_REQUIRED=n
+                ;;
+            D)
+                IS_DEBUG=y
+                ;;
+            h)
+                display_header
+                display_usage
+                ;;
+            l)
+                LOGFILE="${OPTARG?}"
+                ;;
+            n)
+                IS_NOOP=y
+                ;;
+            q)
+                IS_SUPPRESS_OUTPUT=y
+                ;;
+            s)
+                ANSWER_FILE_TO_SAVE="${OPTARG?}"
+                IS_SAVE_ANSWERS=y
+                ;;
+            V)
+                IS_VERBOSE_DEBUG=y
+                ;;
+            ?)
+                display_header
+                display_usage "Illegal option specified"
+                ;;
+        esac
+    done
+
+    #---[ Announce installation ]-------------------------------------------
+
+     # Enforce quiet mode if specified
+     if is_quiet ; then
+       run_quiet_mode
+     fi
+
+    # Enforce very verbose debugging if specified
+    is_verbose_debug
+
+    # Announce installer:
+    display_header
+
+    # Set umask to 0022. This is in a subshell and inside a conditional, so this umask will only
+    # persist for the run of the installer.
+    umask 0022
+
+    # Prepare the installer variable:
+    installer_dir > /dev/null
+
+    [ -s $(installer_dir)/VERSION ] || display_failure "The VERSION file seems to be missing from your installer. The installer cannot proceed without it."
+
+    # Check if we are on a supported platform
+    if [ ${IS_SAVE_ANSWERS} != y ]; then
+      platform_support_check
+    fi
+
+    # Check user:
+    prepare_user
+
+    # Load answers if specified:
+    if [ ! -z "${ANSWER_FILE_TO_LOAD?}" ]; then
+        load_answers "${ANSWER_FILE_TO_LOAD?}"
+
+        # Backward compatibility with answers from PE <= 1.2.x
+        convert_answers
+    fi
+
+    # Prepare log file:
+    if ( ! is_save_answers ) && ( ! is_noop ) ; then
+        prepare_log_file "install"
+    fi
+
+    # PE-537 without libgcc_s.so.1, our compiled software will not run.
+    if [[ "${PLATFORM_TAG}" =~ "solaris-10-(i386|sparc)" ]] && ( ! is_package_installed "SUNWgccruntime" ); then
+        display_failure "SUNWgccruntime provides /usr/sfw/lib/libgcc_s.so.1, which is required for Puppet Enterprise, please install the package from your Solaris installation media and run ${0} again."
+    fi
+
+    # Check if we are working on a system that already has an install
+    if ( ! is_save_answers ) && [ -x /opt/puppet/bin/puppet ]; then
+        IS_UPGRADE=y
+
+        CURRENT_PE_BUILD=$(/opt/puppet/bin/puppet --version | cut -d' ' -f4 | cut -d')' -f1)
+        CURRENT_PE_VERSION=${CURRENT_PE_BUILD%%-*}
+        CURRENT_PE_MAJOR=$(echo $CURRENT_PE_VERSION | cut -d'.' -f1)
+        CURRENT_PE_MINOR=$(echo $CURRENT_PE_VERSION | cut -d'.' -f2)
+        CURRENT_PE_INCR=$(echo $CURRENT_PE_VERSION | cut -d'.' -f3)
+
+        if [ "${CURRENT_PE_BUILD?}" = "${PE_VERSION?}" ]; then
+            display_newline
+            display " === Puppet-Enterprise version ${CURRENT_PE_BUILD?} already installed === "
+            display_newline
+            quit
+        else
+            display_newline
+            display " === Upgrade from version ${CURRENT_PE_BUILD?} detected === "
+            display_newline
+        fi
+
+        # Fail if the current installed version is less than PE 2.8.2
+        t_el_4_regex="el-4-(i386|x86_64)"
+        if ([[ ! "$PLATFORM_TAG" =~ ${t_el_4_regex?} ]] && [ "$(echo_vercmp 2.8.2 $CURRENT_PE_VERSION)" = "1" ]); then
+            display_failure "In order to upgrade to ${PE_VERSION}, you must first be running PE 2.8.2 or higher. To complete the upgrade to ${PE_VERSION}, you need to download and install the latest 2.8.x release (http://puppetlabs.com/misc/pe-files/previous-releases). For more information, see http://docs.puppetlabs.com/pe/2.8/install_upgrading.html. Once you have updated to 2.8.x, you can complete the upgrade to ${PE_VERSION}."
+        elif ([[ "$PLATFORM_TAG" =~ ${t_el_4_regex?} ]] && [ "$(echo_vercmp 2.0.3 $CURRENT_PE_VERSION)" = "1" ]); then
+          display_failure "In order to upgrade to ${PE_VERSION} on EL4, you must first be running PE 2.0.3. To complete the upgrade to ${PE_VERSION}, you need to download and install the 2.0.3 release (http://puppetlabs.com/misc/pe-files/previous-releases). For more information, see http://docs.puppetlabs.com/pe/2.0/install_upgrading.html. Once you have updated to 2.0.3, you can complete the upgrade to ${PE_VERSION}."
+        fi
+
+        # Check if this is an Enterprise Readiness Guide deployment (as opposed
+        # to a stock install). If so, bail out because we can't automatically
+        # upgrade.
+        if [ -e "/etc/puppetlabs/installer/details.txt" ]; then
+            display_failure "Your current version of Puppet Enterprise cannot be automatically upgraded because it uses a non-standard deployment and/or configuration. Please contact Puppet Labs support for assistance with your upgrade."
+        fi
+
+        q_puppetagent_install=y
+
+        if is_cloud_provisioner; then
+            q_puppet_cloud_install='y'
+        else
+            q_puppet_cloud_install='n'
+        fi
+
+        if is_puppetmaster; then
+            q_puppetmaster_install='y'
+            q_puppetmaster_certname="$(/opt/puppet/bin/puppet master --configprint certname)"
+            # TODO Read this from the puppetmaster.conf
+            q_puppetmaster_dnsaltnames=${q_puppetmaster_dnsaltnames:-"$(/opt/puppet/bin/puppet master --configprint dns_alt_names)"}
+            #q_puppetca_install='y'
+
+            extract_console_location_from_enc_script
+        else
+            q_puppetmaster_install='n'
+            #q_puppetca_install='n'
+        fi
+
+        if is_console; then
+            q_puppet_enterpriseconsole_install='y'
+            q_puppet_enterpriseconsole_httpd_port="${q_puppet_enterpriseconsole_httpd_port:-"$(${PLATFORM_EGREP} Listen /etc/puppetlabs/httpd/conf.d/puppetdashboard.conf | sed -e 's/^\s*Listen [^:]*:\([[:digit:]]*\)\s*$/\1/')"}"
+
+            # We transfer by default, but the user can override with an answer file.
+            if [ "${CURRENT_PE_MAJOR?}" -eq "2" ]; then
+                : ${q_database_transfer:='y'}
+            else
+                q_database_transfer='n'
+            fi
+
+            if [ -z "${q_puppet_enterpriseconsole_httpd_port}" ]; then
+                display_failure "Could not determine the existing Puppet Enterprise console port"
+            fi
+        else
+            q_puppet_enterpriseconsole_install='n'
+        fi
+
+        if is_puppetdb; then
+            q_puppetdb_install='y'
+
+            # If it's not installed, we have to ask if they want to move to
+            # pe-postgres, so we can't just set this to no.
+            if is_postgres; then
+                q_database_install='y'
+            fi
+
+            q_puppetdb_plaintext_port="${q_puppetdb_plaintext_port:-"$(get_ini_field '/etc/puppetlabs/puppetdb/conf.d/jetty.ini' 'port')"}"
+            q_puppetdb_hostname="${q_puppetdb_hostname:-"$(get_ini_field '/etc/puppetlabs/puppetdb/conf.d/jetty.ini' 'ssl-host')"}"
+            q_puppetdb_port="${q_puppetdb_port:-"$(get_ini_field '/etc/puppetlabs/puppetdb/conf.d/jetty.ini' 'ssl-port')"}"
+
+            t_main_database_subname="$(get_ini_field '/etc/puppetlabs/puppetdb/conf.d/database.ini' 'subname')"
+            q_database_host="${q_database_host:-$(echo "${t_main_database_subname?}" | sed -e 's/\/\/\([^:][^:]*\):\([0-9][0-9]*\)\/\(\S*\)/\1/')}"
+            q_database_port="${q_database_port:-$(echo "${t_main_database_subname?}" | sed -e 's/\/\/\([^:][^:]*\):\([0-9][0-9]*\)\/\(\S*\)/\2/')}"
+            q_puppetdb_database_name="${q_puppetdb_database_name:-$(echo "${t_main_database_subname?}" | sed -e 's/\/\/\([^:][^:]*\):\([0-9][0-9]*\)\/\(\S*\)/\3/')}"
+
+            q_puppetdb_database_user="${q_puppetdb_database_user:-$(get_ini_field '/etc/puppetlabs/puppetdb/conf.d/database.ini' 'username')}"
+            q_puppetdb_database_password="${q_puppetdb_database_password:-$(get_ini_field '/etc/puppetlabs/puppetdb/conf.d/database.ini' 'password')}"
+        else
+            # This could be changed later during the all-in-one check.
+            q_puppetdb_install='n'
+
+            if is_puppetmaster; then
+                # Try to figure out where PuppetDB is from the puppetdb.conf file
+                if is_package_installed 'pe-puppetdb-terminus' && [ -e '/etc/puppetlabs/puppet/puppetdb.conf' ]; then
+                    q_puppetdb_hostname=${q_puppetdb_hostname:-"$(get_ini_field '/etc/puppetlabs/puppet/puppetdb.conf' server)"}
+                    q_puppetdb_port=${q_puppetdb_port:-"$(get_ini_field '/etc/puppetlabs/puppet/puppetdb.conf' port)"}
+                fi
+            elif is_console; then
+              # Try to figure out where PuppetDB is from the answers.install
+              # file (if the user hasn't removed it). Although it is not an
+              # INI file, it has the same field=value format, so the
+              # `get_ini_field` helper function should be able to parse it
+              # correctly.
+              if [ -s '/etc/puppetlabs/installer/answers.install' ]; then
+                q_puppetdb_hostname=${q_puppetdb_hostname:-"$(get_ini_field '/etc/puppetlabs/installer/answers.install' q_puppetdb_hostname)"}
+                q_puppetdb_port=${q_puppetdb_port:-"$(get_ini_field '/etc/puppetlabs/installer/answers.install' q_puppetdb_port)"}
+              fi
+            fi
+        fi
+
+        # If we're a master and a console, we must be either a 2.x install (in
+        # which case we get converted to all-in-one), or a 3.x all-in-one
+        # install (which means we must already have puppetdb and the database).
+        if is_puppetmaster && is_console; then
+            q_all_in_one_install='y'
+
+            q_puppetdb_install='y'
+        else
+            q_all_in_one_install='n'
+        fi
+
+        if is_console; then
+            if [ "$(echo_vercmp 3.2.0 $CURRENT_PE_VERSION)" = "1" ] && [ "${CURRENT_PE_MAJOR?}" -eq "3" ]; then
+                display_comment "Collecting information..."
+
+                #If the current version is 3.x but less than 3.2.0 we'll be upgrading the database IDs within PostgreSQL from int to bigint.
+                #We try to analyze as much as we can depending on the PE configuration
+                t_current_largest_table_size=$(verbose_bundle_exec "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:current_largest_table_size RAILS_ENV=production" | tail -n 1)
+
+                t_extra_space_percent=20
+
+                #with 'set -e' the let command would fail if it returned zero...
+                if [ ${t_current_largest_table_size?} -gt 0 ]; then
+                    let t_required_tablespace_free="${t_current_largest_table_size?}*(100+${t_extra_space_percent?})/100"
+                else
+                    t_required_tablespace_free=1
+                fi
+
+                # q_database_install may not be set here in the case where it's
+                # not a database install (because we plan to ask later), so the
+                # answer is optional. But if it *is* a database, we know for
+                # sure, so it's safe.
+                if [ ! ${t_current_largest_table_size?} = "-1" ] && [ y = "${q_database_install}" ]; then
+                    #This is the best case - we are on pe-postgres running on the local machine
+                    t_current_tablespace_free=$(verbose_bundle_exec "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:current_tablespace_free RAILS_ENV=production" | tail -n 1)
+
+                    if [ ! ${t_current_tablespace_free?} = "-1" ]; then
+                        #This should always get here (free space should be known) unless there's something unexpected
+                        if [ ${t_current_tablespace_free?} -lt ${t_required_tablespace_free?} ]; then
+                            #We know that there is not enough space so we warn the user. We may be wrong though
+                            #if the database has not been vacuumed regularly! User still has the chance to take the risk.
+                            ask q_upgrade_with_low_disk_space "This upgrade requires an update to your database. To complete successfully, this database update temporarily requires at least ${t_required_tablespace_free?}MB of free disk space on the node providing the database role. Only ${t_current_tablespace_free?}MB of disk space appears to be available, so this upgrade may fail if you choose to continue! Continue anyway?" yN
+
+                            if [ ! y = "${q_upgrade_with_low_disk_space?}" ]; then
+                                quit 1
+                            fi
+                        fi
+                    fi
+
+                else
+                    #The database is not local or it is not pe-postgres - we can't compute the free tablespace
+                    t_current_tablespace_free="-1"
+                fi
+
+                if [ ${t_current_tablespace_free?} = "-1" ]; then
+                    if [ ! ${t_current_largest_table_size?} = "-1" ]; then
+                        #Since we are on pe-postgres we known how much free space we need but we can't compute how much we really have
+                        ask q_upgrade_with_unknown_disk_space "This upgrade requires an update to your database. To complete successfully, this database update temporarily requires at least ${t_required_tablespace_free?}MB of free disk space on the node providing the database role. Is there at least ${t_required_tablespace_free?}MB of free disk space available?" yn
+                    else
+                        #Since we are not on pe-postgres we don't known how much free space we need, it's all user's reponsibility
+                        ask q_upgrade_with_unknown_disk_space "This upgrade requires an update to your database. To complete successfully, this database update temporarily requires some free disk space on the node providing the database role. The space required is about ${t_extra_space_percent?}% larger than the size of the largest table currently in your database. Is this amount of free disk space available?" yn
+                    fi
+
+                    if [ ! y = "${q_upgrade_with_unknown_disk_space?}" ]; then
+                        quit 1
+                    fi
+                fi
+            fi
+        fi
+
+        # If we're a master or console, we need to make sure to respect that
+        # the user may have opted out of update checking. If they set it in an
+        # answer file *now*, use that. Otherwise check if they set it in the
+        # old answer file (if it's still around). Otherwise it's on by default.
+        if (is_puppetmaster || is_console) && [ -s '/etc/puppetlabs/installer/answers.install' ]; then
+            q_pe_check_for_updates=${q_pe_check_for_updates:-"$(get_ini_field '/etc/puppetlabs/installer/answers.install' q_pe_check_for_updates)"}
+        fi
+
+        q_puppetagent_certname="$(/opt/puppet/bin/puppet agent --configprint certname)"
+        q_puppetagent_server="$(/opt/puppet/bin/puppet agent --configprint server)"
+    fi
+
+    #---[ Support for installing in a symlinked opt dir ]--------------------
+
+    if [ -L "/opt" ]; then
+        case "${PLATFORM_NAME?}" in
+            solaris)
+                declare -x PKG_NONABI_SYMLINKS='true'
+                ;;
+        esac
+    fi
+
+    if ! is_upgrade && [ 'false' = "${CLIENT_ONLY?}" ]; then
+        #---[ Interview user ]--------------------------------------------------
+        if [ -z "${ANSWER_FILE_TO_LOAD?}" ]; then
+            t_automated_install_doc_link="http://docs.puppetlabs.com/pe/${PE_LINK_VER?}/install_automated.html"
+            t_answer_file_ref_doc_link="http://docs.puppetlabs.com/pe/${PE_LINK_VER?}/install_answer_file_reference.html"
+            display_step 'GUIDED INSTALLATION' n
+            display_newline
+            display "Before you begin, choose an installation method. We've provided a few paths to choose from."
+            display_newline
+            echo "- Perform a guided installation using the web-based interface. Think of this as an installation interview in which we ask you exactly how you want to install PE. In order to use the web-based installer, you must be able to access this machine on port 3000 and provide the SSH credentials of a user with root access. This method will login to servers on your behalf, install Puppet Enterprise and get you up and running fairly quickly." | display_wrapped_text 0 0
+            display_newline
+            display_newline
+            echo "- Use the web-based interface to create an answer file so that you login to the servers yourself and perform the installation locally. Refer to Automated Installation with an Answer File (${t_automated_install_doc_link?}), which provides an overview on installing PE with an answer file." | display_wrapped_text 0 0
+            display_newline
+            display_newline
+            echo "- If you choose not to use the web-based interface, you can write your own answer file or use the answer file(s) provided in the PE installation tarball. Check the Answer File Reference Overview (${t_answer_file_ref_doc_link?}) to get started." | display_wrapped_text 0 0
+            display_newline
+            display_newline
+
+            ask q_packages_install "Install packages and perform a guided install?" Yn
+
+            if [ 'y' = "${q_packages_install?}" ]; then
+                display_newline
+                display "Installing setup packages."
+                display_newline
+
+                enqueue_installer_packages
+                run_suppress_stdout install_queued_packages
+
+                # Copy the pe installer
+                t_installer_dest="/opt/puppet/share/installer/installer"
+                run "mkdir -p '${t_installer_dest?}'"
+                run "cp -pR '$(installer_dir)'/* '${t_installer_dest?}'"
+
+                # Start installer service
+                INSTALLER_SUPPORTED_PORTS="3000,4567"
+                INSTALLER_PORT=$(find_unused_tcp_port "${PLATFORM_HOSTNAME}" "${INSTALLER_SUPPORTED_PORTS}")
+                if [ "${INSTALLER_PORT}" != '' ]; then
+                    echo "Please go to https://${PLATFORM_HOSTNAME}:${INSTALLER_PORT} in your browser to continue installation. Be sure to use https:// and that port ${INSTALLER_PORT?} is reachable through the firewall." | display_wrapped_text 0 0
+                    display_newline
+
+                    # This will block
+                    pushd /opt/puppet/share/installer &>/dev/null
+
+                    run_suppress_output "RACK_ENV=production /opt/puppet/bin/bundle exec thin start --debug -p ${INSTALLER_PORT} -a 0.0.0.0 --ssl"
+
+                    popd &>/dev/null
+
+                    display_newline
+                    display "Your infrastructure has finished installing."
+                    display "Thank you for installing Puppet Enterprise!"
+                    quit 0
+                else
+                    display_failure "Could not open a TCP port for web server. Tried ${INSTALLER_SUPPORTED_PORTS}."
+                fi
+            else
+                display_newline
+                display_major_separator
+                display_newline
+                display "!! Installation cancelled"
+                display_newline
+                display_major_separator
+                quit 1
+            fi
+        fi
+    fi
+
+    display_step 'SELECT AND CONFIGURE ROLES' n
+    display_newline
+
+    if [ 'false' =  "${CLIENT_ONLY?}" ]; then
+        echo "This installer lets you select and install the various roles required in a Puppet Enterprise deployment: puppet master, console, database, cloud provisioner, and puppet agent." | display_wrapped_text
+        display_newline
+        display_newline
+
+        display "NOTE: when specifying hostnames during installation, use the fully-qualified domain name (foo.example.com) rather than a shortened name (foo)."
+        display_newline
+
+        display_product 'puppet master' "The puppet master serves configurations to a group of puppet agent nodes. This role also provides MCollective's message queue and client interface. It should be installed on a robust, dedicated server."
+        ask q_puppetmaster_install 'Install puppet master?' yN
+
+        if [ y = "${q_puppetmaster_install?}" ]; then
+            display_product "standalone install" "You may choose to either install PuppetDB and the console on this node, or to install each service on its own node. If you choose not to install PuppetDB and the console on this node, you will be asked where to find them."
+            ask q_all_in_one_install "Install PuppetDB and console on this node?" Yn
+
+            # If all-in-one, then autoselect everything. If not all-in-one,
+            # then deselect everything.
+            if [ y = "${q_all_in_one_install?}" ]; then
+                q_puppetdb_install='y'
+                q_puppet_enterpriseconsole_install='y'
+            else
+                q_puppetdb_install='n'
+                q_puppet_enterpriseconsole_install='n'
+            fi
+        else
+            q_all_in_one_install=n
+
+            ask q_puppetagent_server "Puppet master hostname to connect to?" String puppet
+            if ( ! is_save_answers ) && [ 'n' = "${q_skip_master_verification:-"n"}" ] ; then
+                while ! tcp_port_in_use "${q_puppetagent_server}" 8140 ; do
+                    query_about_master_connectivity
+                done
+            fi
+            :           ${q_fail_on_unsuccessful_master_lookup:='y'}
+        fi
+
+        # If you're *not* installing a master, you can choose PuppetDB
+        if [ ! y = "${q_puppetmaster_install?}" ]; then
+            display_product 'database support' "This role provides database support for PuppetDB and PE's console. PuppetDB is a centralized data service that caches data generated by Puppet and provides access to it via a robust API. The console uses data provided by a PostgreSQL server and database both of which will be installed along with PuppetDB on the node you specify."
+
+            echo "IMPORTANT: If you choose not to install PuppetDB at this time, you will be prompted for the host name of the node you intend to use to provide database services. Note that you must install database support on that node for the console to function. When using a separate node, you should install database support on it BEFORE installing the console role." | display_wrapped_text
+            display_newline
+            display_newline
+
+            ask q_puppetdb_install 'Install PuppetDB?' yN
+
+            # If you've chosen PuppetDB, you cannot choose console
+            if [ y = "${q_puppetdb_install?}" ]; then
+                q_puppet_enterpriseconsole_install='n'
+            fi
+        fi
+
+        if [ 'y' = "${q_puppetdb_install?}" ]; then
+            :       ${q_puppetdb_plaintext_port:='8080'}
+            :       ${q_puppetdb_port:='8081'}
+
+            if ( ! is_save_answers ) && (! is_upgrade ); then
+                # Verify that ports 8080 and 8081 (or the port from the answer file) are available if this isn't answer-save mode.
+                for port in $q_puppetdb_plaintext_port $q_puppetdb_port; do
+                    if tcp_port_in_use localhost $port ; then
+                        display_newline
+                        display_failure "Port $port appears to be in use. This port is required for PuppetDB. Please either move the services for this port to another or install on a system with this port available."
+                    fi
+                done
+            fi
+        fi
+
+        # If you're not installing master or PuppetDB, you can install console
+        if [ ! y = "${q_puppetmaster_install?}" -a ! y = "${q_puppetdb_install?}" ]; then
+            display_product 'console' "The console is a web interface where you can view reports, classify nodes, control Puppet runs, and invoke MCollective agents. It can be installed on the puppet master's node, but for performance considerations, especially in larger deployments, it can also be installed on a separate node."
+            ask q_puppet_enterpriseconsole_install 'Install the console?' yN
+            q_puppetca_install='n'
+        fi
+
+        # Verify that port 8140 is available if this isn't answer-save mode and we're not upgrading.
+        if ( ! is_save_answers ) && ( ! is_upgrade ) && [ 'y' = "${q_puppetmaster_install?}" -o 'y' = "${q_puppet_enterpriseconsole_install?}" ] && tcp_port_in_use localhost 8140 ; then
+            display_newline
+            display_failure "Port 8140 appears to be in use. This port is required for the puppet master. Please either move the services for this port to another or install on a system with this port available."
+        fi
+
+        # Verify they haven't somehow chosen two out of three roles (such as
+        # answer file). This shouldn't actually be possible, since we
+        # automatically deselect roles during the interview, but better to be
+        # safe than sorry.
+        if [ y = "${q_puppetmaster_install?}" -a y = "${q_puppetdb_install?}" -a ! y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            display_failure "You may not select the Puppet master and PuppetDB roles together without the console role. Please select either an all-in-one install or a single role."
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" -a ! y = "${q_puppetdb_install?}" -a y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            display_failure "You may not select the Puppet master and console roles together without the PuppetDB role. Please select either an all-in-one install or a single role."
+        fi
+
+        if [ ! y = "${q_puppetmaster_install?}" -a y = "${q_puppetdb_install?}" -a y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            display_failure "You may not select the PuppetDB and console roles together without the Puppet master role. Please select either an all-in-one install or a single role."
+        fi
+
+        # If we're not installing PuppetDB, we probably need to know where it is.
+        if [ ! y = "${q_puppetdb_install?}" ] && [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            if [ y = "${q_puppetmaster_install?}" ] && !(is_upgrade && is_PE_x_or_greater '3'); then
+                display_newline
+                echo "Puppet Enterprise requires the installation of PuppetDB.  PuppetDB needs to be cleanly installed on a new node after the installation of the puppet master has successfully completed. Please provide the hostname and port for the node on which you will be installing PuppetDB." | display_wrapped_text
+                display_newline
+                display_newline
+            fi
+            ask q_puppetdb_hostname "Hostname for contacting PuppetDB?" String
+            ask q_puppetdb_port "Port for contacting PuppetDB?" Port "8081"
+            :       ${q_puppetdb_plaintext_port:='8080'}
+        fi
+
+        if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            :                ${q_puppetmaster_enterpriseconsole_hostname:='localhost'}
+        elif [ y = "${q_puppetmaster_install?}" ]; then
+            if ! is_upgrade ; then
+                display_newline
+                echo "Puppet Enterprise requires the installation of the Console.  The Console needs to be cleanly installed on a new node after the installation of the puppet master has successfully completed. Please provide the hostname and port for the node on which you will be installing the Console." | display_wrapped_text
+                display_newline
+                display_newline
+            fi
+            ask q_puppetmaster_enterpriseconsole_hostname "Hostname for contacting the console?" String
+            ask q_puppetmaster_enterpriseconsole_port "Port for contacting the console?" Port "443"
+        fi
+
+        display_product 'cloud provisioner' 'The cloud provisioner can create and bootstrap new machine instances and add them to your Puppet infrastructure. It should be installed on a trusted node where site administrators have shell access.'
+        ask q_puppet_cloud_install 'Install the cloud provisioner?' yN
+
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" -o y = "${q_puppetdb_install?}" -o y = "${q_puppet_cloud_install?}" ]; then
+            q_puppetagent_install='y'
+            display_product 'puppet agent' 'The puppet agent role is automatically installed with the console, puppet master, puppetdb, and cloud provisioner roles.'
+        else
+            display_product 'puppet agent' 'The puppet agent applies configurations from the puppet master and submits reports and inventory information. It should be installed on every node you plan to manage with Puppet.'
+            ask q_puppetagent_install 'Install puppet agent?' Yn
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" ]; then
+            ask q_puppetmaster_certname "The puppet master's certificate will contain a unique name (\"certname\"); this should be the main DNS name at which it can be reliably reached. Puppet master's certname?" StringForceLowerCase "${PLATFORM_HOSTNAME?}" # The master's certname gets used as the filebucket server in site.pp. If it isn't a reachable DNS name, users have to edit site.pp post-install.
+            ask q_puppetmaster_dnsaltnames "The puppet master's certificate can contain DNS aliases; agent nodes will only trust the master if they reach it at its certname or one of these official aliases. Puppet master's DNS aliases (comma-separated list)?" StringDNSName "$(display_dnsaltnames "${q_puppetmaster_certname?}" "puppet")"
+            display_newline
+        fi
+
+        if [ y = "${q_puppetdb_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            if [ y = "${q_puppetdb_install?}" ]; then
+                if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+                    t_main_database_products="The Puppet Enterprise console and PuppetDB"
+                    t_main_database_verb="require"
+                else
+                    t_main_database_products="PuppetDB"
+                    t_main_database_verb="requires"
+                fi
+
+                echo "${t_main_database_products?} ${t_main_database_verb?} a PostgreSQL database and a user account able to edit it. Puppet Enterprise includes a Postgresql server which you can install locally, or you can specify an existing remote database (which must be configured and available prior to installing the console or PuppetDB)." | display_wrapped_text
+            elif [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+                echo "The Puppet Enterprise console requires a PostgreSQL database and a user account able to edit it. This database and the Puppet Enterprise PostgreSQL server are automatically installed and configured, along with PuppetDB, on a node you select for the database support role. You should install this role BEFORE installing the console role. After installing the database support role, you can find auto-generated passwords for the database user and the authentication database user in '/etc/puppetlabs/installer/database_info.install' on that node." | display_wrapped_text
+            fi
+            display_newline
+            display_newline
+        fi
+
+        if [ y = "${q_puppetdb_install?}" ]; then
+            ask q_database_install "Install the included Puppet Enterprise PostgreSQL server locally?" Yn
+            # This variable represents whether or not we're using PE postgres,
+            # independently of whether it's installed on this node. The main
+            # purpose of the variable is to feed into the console install so we
+            # know whether to classify the PuppetDB node with manage_database
+            # true or false.
+            q_pe_database="${q_database_install?}"
+        else
+            q_database_install='n'
+        fi
+
+        if [ y = "${q_database_install?}" ]; then
+
+            if ! is_save_answers && ! is_upgrade && [ -x /opt/puppet/var/lib/pgsql ] && [ "y" != "${q_skip_backup}" ]; then
+                display_newline
+                display " === Existing Puppet Enterprise data detected === "
+                display_newline
+                display_comment "It looks like Puppet Enterprise had been installed on this machine and it was uninstalled without the purge data option (-d). The existing databases cannot be reused by this installer. You can either quit this installation or the installer can move your existing database directory to /opt/puppet/var/lib/pgsql.<yyyymmddHHMMSS>.bak and create a new one."
+                ask q_backup_and_purge_old_database_directory "Would you like to backup your existing database directory and continue installing Puppet Enterprise?" yN
+                if [ "y" != "${q_backup_and_purge_old_database_directory?}" ]; then
+                    quit 1
+                fi
+            else
+                q_backup_and_purge_old_database_directory='n'
+            fi
+
+            q_database_root_user="pe-postgres"
+            # If we're installing both PuppetDB and console, then we can just
+            # listen on localhost. Otherwise, console needs to be able to
+            # access postgres, so it has to listen on a public port.
+            if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+                : ${q_database_host:='localhost'}
+            else
+                : ${q_database_host:="${PLATFORM_HOSTNAME?}"}
+            fi
+            q_database_port='5432'
+            # Verify that port 5432 is available for the pe-postgresql server
+            if ( ! is_save_answers ) && ( ! is_upgrade ) && tcp_port_in_use localhost ${q_database_port} ; then
+                display_newline
+                display_failure "Port ${q_database_port} appears to be in use. This port is required for the Puppet Enterprise Postgresql Server. Please either move the services for this port to another or install on a system with this port available."
+            fi
+
+            q_database_root_password="${q_database_root_password:-"$(gen_password)"}"
+
+            # We're doing setup, so set db variable defaults
+            set_database_defaults
+          elif [ y = "${q_puppetdb_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ] && !(is_upgrade && is_PE_x_or_greater '3'); then
+            # On split PuppetDB/Console installs, default to PuppetDB location
+            # as the likely location of postgres. It's either that or they're
+            # using their own. On combined or PuppetDB-only installs, we have
+            # nothing to reasonably default to.
+            if [ y = "${q_puppet_enterpriseconsole_install?}" -a ! y = "${q_puppetdb_install?}" ]; then
+                ask q_database_host "What is the hostname of the PostgreSQL server?" String "${q_puppetdb_hostname?}"
+            else
+                ask q_database_host "What is the hostname of the PostgreSQL server?" String
+            fi
+            ask q_database_port "What is the port of the PostgreSQL server?" Port "5432"
+            if [ y = "${q_puppet_enterpriseconsole_install?}" -a ! y = "${q_database_install?}" ]; then
+                ask q_pe_database "Was the PostgreSQL server installed and configured by Puppet Enterprise?" yN
+            fi
+            if [ y = "${q_puppetdb_install?}" ]; then
+                ask q_puppetdb_database_name "What is the name of the PuppetDB database?" String pe-puppetdb
+                ask q_puppetdb_database_user "What is the name of the PuppetDB database user?" String pe-puppetdb
+                ask q_puppetdb_database_password "What is the password for ${q_puppetdb_database_user?} (the database user)?" Password4
+            fi
+        fi
+
+        if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            if ! is_upgrade; then
+                # We already know the port to use in an upgrade, so we don't want to find a new one or ask.
+                if ! is_save_answers; then
+                    default_console_port=$(find_unused_tcp_port "localhost" "${CONSOLE_PORT_OPTIONS}")
+                    if [ -z "${default_console_port}" ] ; then
+                        ask q_puppet_enterpriseconsole_httpd_port "None of the default ports (${CONSOLE_PORT_OPTIONS}) are open for use by the PE console. What is a port for use by the PE console?" Port
+                    else
+                        q_puppet_enterpriseconsole_httpd_port="${q_puppet_enterpriseconsole_httpd_port:-"${default_console_port}"}"
+                    fi
+                else
+                    ask q_puppet_enterpriseconsole_httpd_port "What is a port for use by the PE console?" Port "443"
+                fi
+
+                # In an upgrade, this user already exists, so we don't ask.
+                ask q_puppet_enterpriseconsole_auth_user_email "Admin email address (will be used as account name) for accessing the console interface?" Email
+                ask q_puppet_enterpriseconsole_auth_password "Password for user ${q_puppet_enterpriseconsole_auth_user_email?} (minimum 8 characters)?" Password8
+            fi
+
+            if [ y = "${q_puppetmaster_install}" ]; then
+                :                ${q_puppet_enterpriseconsole_master_hostname:="${q_puppetmaster_certname?}"}
+                q_puppetmaster_enterpriseconsole_port="${q_puppet_enterpriseconsole_httpd_port?}"
+            fi
+
+            # Mail server questions.
+
+            # These answers are set by default but still saved in the answer file.
+            # The smtp username and password answers are blank by default but still
+            # saved in the answer file to provide the user the template for setting
+            # these values manually.
+            q_puppet_enterpriseconsole_smtp_use_tls="${q_puppet_enterpriseconsole_smtp_use_tls:-"n"}"
+            q_puppet_enterpriseconsole_smtp_port="${q_puppet_enterpriseconsole_smtp_port:-25}"
+            q_puppet_enterpriseconsole_smtp_user_auth="${q_puppet_enterpriseconsole_smtp_user_auth:-"n"}"
+            q_puppet_enterpriseconsole_smtp_username="${q_puppet_enterpriseconsole_smtp_username:-""}"
+            q_puppet_enterpriseconsole_smtp_password="${q_puppet_enterpriseconsole_smtp_password:-""}"
+
+            # On an upgrade, this has already been set, so no need to ask.
+            if ! is_upgrade; then
+                display_newline
+                echo "The console requires an SMTP server to email account information to users." | display_wrapped_text
+                display_newline
+                ask q_puppet_enterpriseconsole_smtp_host 'What is the name of your SMTP server?' String
+            fi
+
+            set_t_path_to_psql
+
+            if ! ( is_upgrade && is_PE_x_or_greater '3') && [ ! y = "${q_database_install?}" ]; then
+                ask q_puppet_enterpriseconsole_database_name "What is the name of the console database?" String console
+                ask q_puppet_enterpriseconsole_database_user "What is the name of the console database user?" String console
+                ask q_puppet_enterpriseconsole_database_password "What is the password for ${q_puppet_enterpriseconsole_database_user?} (the database user)?" Password4
+
+                ask q_puppet_enterpriseconsole_auth_database_name "What is the name of the authentication database?" String console_auth
+                while [ "${q_puppet_enterpriseconsole_auth_database_name?}" = "${q_puppet_enterpriseconsole_database_name?}" ]; do
+                    unset q_puppet_enterpriseconsole_auth_database_name
+                    display "You cannot use the same database for both the console and the authentication database."
+                    ask q_puppet_enterpriseconsole_auth_database_name "What is the name of the authentication database?" String console_auth
+                done
+
+                ask q_puppet_enterpriseconsole_auth_database_user "What is the name of the authentication database user?" String console_auth
+                while [ "${q_puppet_enterpriseconsole_auth_database_user?}" = "${q_puppet_enterpriseconsole_database_user?}" ]; do
+                    if [ "${q_puppet_enterpriseconsole_auth_database_user?}" = "${q_puppet_enterpriseconsole_database_user?}" ]; then
+                        display "You cannot use the same user as both the console and the authentication database user."
+                    fi
+
+                    unset q_puppet_enterpriseconsole_auth_database_user
+                    ask q_puppet_enterpriseconsole_auth_database_user "What is the name of the authentication database user?" String console_auth
+                done
+                ask q_puppet_enterpriseconsole_auth_database_password "What is the password for ${q_puppet_enterpriseconsole_auth_database_user?} (the user authentication database user)?" Password4
+            fi
+
+            if ! (is_upgrade && is_PE_x_or_greater '3') && [ ! y = "${q_puppetdb_install?}" ]; then
+                display_newline
+                echo "In order to properly classify ${q_puppetdb_hostname?} as a PuppetDB server and provide continued management, you must provide the PuppetDB database information." | display_wrapped_text
+                display_newline
+                ask q_puppetdb_database_name "What is the name of the PuppetDB database?" String pe-puppetdb
+                ask q_puppetdb_database_user "What is the name of the PuppetDB database user?" String pe-puppetdb
+                ask q_puppetdb_database_password "What is the password for ${q_puppetdb_database_user?} (the database user)?" Password4
+            fi
+
+            # If it's a remote postgres and we're not just saving answers, we
+            # need to validate that we can connect, and that the
+            # databases/users exist. If it's our postgres, we're already going
+            # to be ensuring those things, so no need to validate.
+            if [ n = "${q_database_install?}" ] && ! is_save_answers; then
+                if [ -n "${t_path_to_psql}" ]; then
+                    verify_db
+                    need_to_verify_db=n
+                else
+                    need_to_verify_db=y
+                fi
+            fi
+        fi
+    else
+        display_newline
+        if [ "${PLATFORM_NAME}" = "aix" ] ; then
+            PLATFORM_DISPLAY_NAME=AIX
+        else
+            PLATFORM_DISPLAY_NAME=${PLATFORM_NAME}
+        fi
+        echo "${PLATFORM_DISPLAY_NAME?} ${PLATFORM_RELEASE?} only supports agent installation."
+        q_puppetmaster_install='n'
+        q_puppet_enterpriseconsole_install='n'
+        q_puppetca_install='n'
+        q_puppetagent_install='y'
+        q_puppet_cloud_install='n'
+        q_puppetdb_install='n'
+        q_database_install='n'
+        q_all_in_one_install='n'
+
+        ask q_puppetagent_server "Puppet master hostname to connect to?" String puppet
+        if ( ! is_save_answers ) && [ 'n' = "${q_skip_master_verification:-"n"}" ] ; then
+            while ! tcp_port_in_use "${q_puppetagent_server}" 8140 ; do
+                query_about_master_connectivity
+            done
+        fi
+        :       ${q_fail_on_unsuccessful_master_lookup:='y'}
+    fi
+
+    if [ y = "${q_puppetagent_install?}" ]; then
+        t_default_agent_certname="${PLATFORM_HOSTNAME?}"
+        # If we're on a master, and the user isn't driving the installer from an answer file
+        # set the certname to the master certname provided earlier
+        if [ y = "${q_puppetmaster_install?}" ]; then
+            # Update the default value to remove visually jarring difference in default/answer.
+            t_default_agent_certname="${q_puppetmaster_certname}"
+            if [ -z "${q_puppetagent_certname}" ]; then
+                q_puppetagent_certname="${q_puppetmaster_certname}"
+            fi
+            :            ${q_puppetagent_server:="${q_puppetmaster_certname?}"}
+        else
+            ask q_puppetagent_certname "Puppet agent needs a unique name (\"certname\") for its certificate; this can be an arbitrary string. Certname for this node?" StringForceLowerCase "${t_default_agent_certname}"
+
+            if [ y = "${q_puppet_enterpriseconsole_install?}" -a n = "${q_puppetmaster_install?}" ]; then
+                :                ${q_puppet_enterpriseconsole_master_hostname:="${q_puppetagent_server?}"}
+            fi
+        fi
+    fi
+
+    if [ y = "${q_puppetdb_install?}" ]; then
+        # We need to know this for classification, and to bind host and port
+        :       ${q_puppetdb_hostname:="${q_puppetagent_certname?}"}
+    fi
+
+    if [ ! y = "${q_puppetmaster_install?}" ]; then
+        if [ y = "${q_puppet_enterpriseconsole_install?}" -a ! -s '/etc/puppetlabs/console-auth/certificate_authorization.yml' ] || ( [ y = "${q_puppetdb_install?}" ] && ! is_upgrade ); then
+            ask q_puppetmaster_certname "What is the certname of the puppet master?" StringForceLowerCase "${q_puppetagent_server?}"
+        fi
+    fi
+
+    if [ 'xaix' = "x${PLATFORM_NAME}" -a -x /usr/sbin/updtvpkg ] ; then
+        display_product 'updtvpkg' "Puppet Enterprise contains rpm packages that depend on native AIX libraries. In order to resolve these dependencies correctly, the 'updtvpkg' command is used to populate the rpm database with the native AIX libraries already present on the system."
+        ask q_run_updtvpkg "Run 'updtvpkg' to populate the rpm database with available native libaries? (this may take some time)" Yn
+    else
+        q_run_updtvpkg=n
+    fi
+
+    #...[ Vendor packages ].................................................
+
+    enqueue_vendor_packages
+
+    # Determine which vendor packages are missing
+    t_main_missing_vendor_packages="$(missing_queued_packages)"
+
+    # Continue interview
+    if [ ! -z "${ANSWER_FILE_TO_SAVE?}" ]; then
+      # When saving answers, always prompt user to install vendor packages
+      display_product 'Vendor Packages' "Puppet Enterprise may require additional packages from your operating system vendor. You will need to either install these yourself, or allow them to be automatically installed from your operating system's package repositories."
+      if [ ! -z "${t_main_missing_vendor_packages?}" ]; then
+        if [ -d `platform_package_dir` ]; then
+          display_missing_vendor_packages "${t_main_missing_vendor_packages?}"
+        fi
+      fi
+      ask q_vendor_packages_install 'Allow automatic installation of these packages?' Yn
+    elif [ ! -z "${t_main_missing_vendor_packages?}" ]; then
+      # Check for RHEL4 here and bail if we're missing vendor packages.
+      # RHEL4 doesn't have yum, so installing vendor packages is an exercise left to the user
+      if [ "${VENDOR_PACKAGE_OFFLINE?}" = "true" ]; then
+        display_product 'Vendor Packages' "The installer has detected that Puppet Enterprise requires additional packages from your operating system vendor's repositories, and cannot automatically install them. The installer will now exit so you can install them manually."
+        display_missing_vendor_packages "${t_main_missing_vendor_packages?}"
+        display_failure "You must manually install the above packages before installing Puppet Enterprise."
+      else
+        # When running, only prompt user to install vendor packages if needed
+        display_product 'Vendor Packages' "The installer has detected that Puppet Enterprise requires additional packages from your operating system vendor's repositories, and can automatically install them. If you choose not to install these packages automatically, the installer will exit so you can install them manually."
+        display_missing_vendor_packages "${t_main_missing_vendor_packages?}"
+        ask q_vendor_packages_install 'Install these packages automatically?' Yn
+        if [ ! y = "${q_vendor_packages_install?}" ]; then
+          display_failure "You must manually install the above packages before installing Puppet Enterprise."
+        fi
+      fi
+    else
+      # Set default value
+      q_vendor_packages_install="${q_vendor_packages_install:-"n"}"
+    fi
+
+    #...[ Check for existing configuration ]...............................
+
+    if is_pe_service_install && ! is_upgrade && [ "y" != "${q_skip_backup}" ]; then
+        if ( ! is_save_answers ) && [ -x /etc/puppetlabs ] ; then
+            display_newline
+            display " === Existing Puppet Enterprise configuration detected === "
+            display_newline
+
+            display_comment "It looks like Puppet Enterprise had been installed on this machine and it was uninstalled without the purge option (-p). The existing configuration cannot be reused by this installer. You can either quit this installation or the installer can move your existing configuration to /etc/puppetlabs.<yyyymmddHHMMSS>.bak and create a new one."
+            ask q_backup_and_purge_old_configuration "Would you like to backup your existing configuration and continue installing Puppet Enterprise?" yN
+            if [ "y" != "${q_backup_and_purge_old_configuration?}" ]; then
+                quit 1
+            fi
+        else
+            q_backup_and_purge_old_configuration='n'
+        fi
+    fi
+
+    #---[ Quit early ]------------------------------------------------------
+
+    if ! is_pe_service_install && [ ! y = "${q_puppetagent_install?}" -a ! y = "${q_puppet_cloud_install?}" ]; then
+        display_newline
+        display_major_separator
+        display_newline
+        display_failure "Nothing selected for installation"
+    fi
+
+    #---[ Confirm ]---------------------------------------------------------
+
+    display_step 'CONFIRM PLAN'
+
+    render_plan
+
+    #---[ Set OFFER_ROLL_BACK flag ]----------------------------------------------
+    # Up until this point, we have made no changes to a system, so a failure
+    # prior to this point would not require any sort of roll-back to restore
+    # a system to a pristine state. After this point, we may have modified a
+    # a system, if only to save an answers file, so we can offer to roll
+    # back using the uninstaller
+    OFFER_ROLL_BACK='y'
+
+    if is_upgrade; then
+        if is_pe_service_install; then
+            display "It is strongly recommended that you take a snapshot of this system before performing the upgrade."
+            display_newline
+        fi
+
+        ask q_install 'Perform upgrade?' Yn
+    else
+        ask q_install 'Perform installation?' Yn
+    fi
+
+    if [ ! y = "${q_install?}" ]; then
+        display_newline
+        display_major_separator
+        display_newline
+        display "!! Installation cancelled"
+        display_newline
+        display_major_separator
+        do_save_answers
+        quit 1
+    else
+        if ! is_upgrade; then
+          if [ "y" = "${q_backup_and_purge_old_configuration:-'n'}" ]; then
+            run "mv /etc/puppetlabs /etc/puppetlabs.$(date '+%Y%m%d%H%M%S').bak"
+            run "./puppet-enterprise-uninstaller -py"
+          fi
+
+          if [ "y" = "${q_backup_and_purge_old_database_directory:-'n'}" ]; then
+            run "mv /opt/puppet/var/lib/pgsql /opt/puppet/var/lib/pgsql.$(date '+%Y%m%d%H%M%S').bak"
+          fi
+        fi
+
+        do_save_answers
+        if [ y = "${q_database_install}" ]; then
+            if is_upgrade && is_PE_x_or_greater '3'; then
+                display "Preserving existing database_info"
+            else
+                save_database_info_etc
+            fi
+        fi
+    fi
+
+    #---[ Ignore q_upgrade_installation=y, #16091 ]------------------------
+    ignore_duplicate 'upgrade'
+
+    #---[ Export answers for use with erb ]---------------------------------
+
+    for t_env_variable in `set | ${PLATFORM_EGREP?} '^q_' | sed -n 's/^\(q_[^=][^=]*\).*$/\1/p'`; do export ${t_env_variable}; done
+    # Export a non-q variable
+    export PLATFORM_HOSTNAME
+
+    # PLATFORM_HOSTNAME_SHORT is used by databases.erb
+    export PLATFORM_HOSTNAME_SHORT
+
+    # This is needed for puppet.conf
+    export PLATFORM_NAME
+    export PLATFORM_PUPPET_GROUP
+    export PLATFORM_PUPPET_USER
+
+    # These are used to make package repos
+    export PE_VERSION
+    export PLATFORM_TAG
+
+    #---[ Stop services for upgrade ]---------------------------------------
+
+    if is_upgrade ; then
+        display_comment "Stopping Puppet Enterprise services for upgrade"
+
+        if is_puppetmaster || is_console; then
+            run_suppress_stdout "/opt/puppet/bin/puppet resource service pe-httpd ensure=stopped"
+        fi
+        if is_console; then
+            run_suppress_stdout "/opt/puppet/bin/puppet resource service pe-puppet-dashboard-workers ensure=stopped"
+        fi
+        if is_puppetdb; then
+            run_suppress_stdout "/opt/puppet/bin/puppet resource service pe-puppetdb ensure=stopped"
+        fi
+        for agent in pe-puppet pe-puppet-agent puppetagent; do
+            run_suppress_stdout "/opt/puppet/bin/puppet resource service $agent ensure=stopped ||:"
+        done
+    fi
+    #---[ Enqueue our packages ]--------------------------------------------
+
+    # NONPORTABLE
+    # Install cloud gems
+    if [ y = ${q_puppet_cloud_install?} ]; then
+        handle_cloud
+    fi
+
+    if [ "${VENDOR_PACKAGE_OFFLINE?}" = "true" ]; then
+        # If we've gotten this far, all of the vendor packages are installed,
+        # so we need to unset the variable to allow the installation of all
+        # rpms regardless of presence.
+        unset PACKAGES_REQUIRED
+    fi
+
+    enqueue_agent_packages
+
+    if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        case "${PLATFORM_NAME?}" in
+            amazon | centos | rhel | sles)
+                enqueue_package 'pe-httpd'
+                enqueue_package 'pe-passenger'
+                enqueue_package 'pe-mod_ssl'
+                enqueue_package 'pe-rubygem-rack'
+                enqueue_package 'pe-mcollective-client'
+                ;;
+            ubuntu | debian)
+                enqueue_package 'pe-httpd-mpm-worker'
+                enqueue_package 'pe-httpd-common'
+                enqueue_package 'pe-httpd'
+                enqueue_package 'pe-httpd-bin'
+                enqueue_package 'pe-httpd-utils'
+                enqueue_package 'pe-passenger'
+                enqueue_package 'pe-rubygem-rack'
+                enqueue_package 'pe-mcollective-client'
+                ;;
+            *)
+                display_failure "Do not know how to install HTTPD or Puppet master on this platform"
+                ;;
+        esac
+    fi
+
+    if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        # PostgreSQL Packages for PE Console
+        enqueue_package 'pe-postgresql'
+        # we are installing /opt/puppet/bin/psql at this point
+        # override any version we found earlier
+        t_path_to_psql='/opt/puppet/bin/psql'
+        if [ y = "${q_database_install?}" ]; then
+            enqueue_package 'pe-postgresql-server'
+        fi
+    fi
+
+    if [ y = "${q_puppetmaster_install?}" ]; then
+        enqueue_package 'pe-puppet-server'
+        # Mcollective Client Packages (and puppetdb)
+        enqueue_package 'pe-java'
+        enqueue_package 'pe-activemq'
+        # "puppet license" command
+        enqueue_package 'pe-puppet-license-cli'
+    fi
+
+    if [ y = "${q_puppetdb_install?}" ]; then
+        enqueue_package 'pe-java'
+
+        # PostgreSQL Packages
+        enqueue_package 'pe-postgresql'
+        # we are installing /opt/puppet/bin/psql at this poing
+        # override any previously found version
+        t_path_to_psql='/opt/puppet/bin/psql'
+        if [ y = "${q_database_install?}" ]; then
+            enqueue_package 'pe-postgresql-server'
+        fi
+    fi
+
+    if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        # Dashboard Packages
+        enqueue_package 'pe-puppet-dashboard'
+        enqueue_package 'pe-bundler'
+
+        # Live Management Packages
+        enqueue_package 'pe-libevent'
+        enqueue_package 'pe-memcached'
+        enqueue_package 'pe-live-management'
+        # Console packages
+        enqueue_package 'pe-console-auth'
+        enqueue_package 'pe-console'
+        enqueue_package 'pe-certificate-manager'
+        enqueue_package 'pe-license-status'
+        enqueue_package 'pe-rubycas-server'
+        enqueue_package 'pe-event-inspector'
+    fi
+
+    #---[ Write out PE version ]-------------------------------------------
+
+    # We need to do this before the puppet agent gets started for the first time
+    # to ensure the version gets picked up correctly, so we pick the last time
+    # before the packages are installed.
+
+    if ! is_noop; then
+        run_suppress_stdout "mkdir -p /opt/puppet && chown ${PLATFORM_ROOT_USER}:${PLATFORM_ROOT_GROUP} /opt/puppet && chmod 755 /opt/puppet"
+        run_suppress_stdout "cp ${INSTALLER_DIR}/VERSION /opt/puppet/pe_build && chown ${PLATFORM_ROOT_USER}:${PLATFORM_ROOT_GROUP} /opt/puppet/pe_build && chmod 644 /opt/puppet/pe_build"
+    fi
+
+    #---[ Install support/uninstaller scripts ]------------------------------------------------
+
+    if is_pe_service_install; then
+        run_suppress_stdout "mkdir -p /opt/puppet/bin && chown ${PLATFORM_ROOT_USER}:${PLATFORM_ROOT_GROUP} /opt/puppet/bin && chmod 755 /opt/puppet/bin"
+        run_suppress_stdout "mkdir -p /opt/puppet/share/installer && chown ${PLATFORM_ROOT_USER}:${PLATFORM_ROOT_GROUP} /opt/puppet/share /opt/puppet/share/installer && chmod 755 /opt/puppet/share /opt/puppet/share/installer"
+        run_suppress_stdout "cp ${INSTALLER_DIR}/puppet-enterprise-support ${INSTALLER_DIR}/puppet-enterprise-uninstaller /opt/puppet/bin"
+        run_suppress_stdout "cp ${INSTALLER_DIR}/utilities /opt/puppet/share/installer/utilities"
+        run_suppress_stdout "chown ${PLATFORM_ROOT_USER}:${PLATFORM_ROOT_GROUP} /opt/puppet/bin/puppet-enterprise-support /opt/puppet/bin/puppet-enterprise-uninstaller /opt/puppet/share/installer/utilities"
+        run_suppress_stdout "chmod 755 /opt/puppet/bin/puppet-enterprise-support /opt/puppet/bin/puppet-enterprise-uninstaller /opt/puppet/share/installer/utilities"
+    fi
+
+    #---[ Install packages ]------------------------------------------------
+
+    display_step 'INSTALL PACKAGES'
+
+    if [ 'y' = "${q_run_updtvpkg}" ] ; then
+        display_comment 'Running /usr/sbin/updtvpkg to update rpm database...'
+        run_suppress_output '/usr/sbin/updtvpkg'
+    fi
+
+    if is_upgrade && is_console && [ y = "${q_database_transfer?}" ]; then
+        display_comment "Analyzing current database settings..."
+
+        t_transfer_console_tmp_dir=$(run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:tmpdir RAILS_ENV=production" | tail -n 1)
+
+        t_transfer_console_auth_tmp_dir=$(run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:tmpdir RAILS_ENV=production" | tail -n 1)
+
+        #we need to know the original database names, user names, hosts and ports, and we need to store passwords to the source databases in a secure way
+        t_source_console_db_name=$(run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:current_database RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console database name is ${t_source_console_db_name?}"
+
+        t_source_console_user_name=$(run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:current_user RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console database user is ${t_source_console_user_name?}"
+
+        t_source_console_host=$(run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:current_host RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console database host is ${t_source_console_host?}"
+
+        t_source_console_port=$(run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:current_port RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console database port is ${t_source_console_port?}"
+
+        t_source_console_auth_db_name=$(run "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:console_auth:current_database RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console_auth database name is ${t_source_console_auth_db_name?}"
+
+        t_source_console_auth_user_name=$(run "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:console_auth:current_user RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console_auth user name is ${t_source_console_auth_user_name?}"
+
+        t_source_console_auth_host=$(run "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:console_auth:current_host RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console_auth host is ${t_source_console_auth_host?}"
+
+        t_source_console_auth_port=$(run "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:console_auth:current_port RAILS_ENV=production" | tail -n 1)
+
+        display_comment "Current console_auth port is ${t_source_console_auth_port?}"
+
+        # let's store the passwords now
+        run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:store_source_password RAILS_ENV=production TMPDIR=${t_transfer_console_tmp_dir?}"
+
+        run "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:console_auth:store_source_password RAILS_ENV=production TMPDIR=${t_transfer_console_auth_tmp_dir?}"
+
+        # we need the target databases to be migrated down to the same version as the source databases
+        # therefore we need to figure out what the versions of current databases are
+        t_source_console_db_version=$(run "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:version RAILS_ENV=production" | ${PLATFORM_EGREP?} '^Current version:' | sed 's/^Current version: //g')
+
+        display_comment "Current console database migration version is ${t_source_console_db_version?}"
+
+        t_source_console_auth_db_version=$(run "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:migrate RAILS_ENV=production" | tail -n 1 | sed 's/^Migrating to .*(\([0-9]*\))$/\1/g')
+
+        display_comment "Current console_auth database migration version is ${t_source_console_auth_db_version?}"
+    fi
+
+    if is_upgrade; then
+        display_comment 'Upgrading packages'
+    fi
+    install_queued_packages
+
+    if [ y = "${q_puppetdb_install?}" ]; then
+        # Make sure the en_US locale with the UTF8 charset is available:
+        verify_en_us_utf8
+    fi
+
+    # If we couldn't verify postgres earlier (because it wasn't installed),
+    # verify it now.
+    if [ y = "${need_to_verify_db:-'n'}" ]; then
+        verify_db
+    fi
+
+    #---[ Generate "puppet.conf" ]------------------------------------------
+
+    if is_upgrade; then
+        # nothing, we want to preserve the existing puppet.conf
+        display_comment 'Preserving existing puppet.conf for now...'
+    else
+        run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/puppet.conf.erb' > '/etc/puppetlabs/puppet/puppet.conf'"
+    fi
+
+    #---[ Lay down "autosign.conf" if master w/o console ] -----------------
+
+    if [ y = ${q_puppetmaster_install?} -a n = ${q_puppet_enterpriseconsole_install?} ]; then
+        run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/autosign.conf.erb' >> '/etc/puppetlabs/puppet/autosign.conf'"
+    fi
+
+    #---[ Extend "autosign.conf" if master with remote puppetdb ] -----------------
+
+    if [ y = ${q_puppetmaster_install?} -a n = ${q_puppetdb_install?} ]; then
+        run "echo ${q_puppetdb_hostname?} >> '/etc/puppetlabs/puppet/autosign.conf'"
+    fi
+
+    #---[ Setup packages ]--------------------------------------------------
+
+    if [ y = "${q_puppetmaster_install?}" ]; then
+        display_comment 'Setting up puppet master...'
+
+        # FIXME PACKAGING should packages create these directories and set ownership?
+        run_suppress_stdout "mkdir -p /var/opt/lib/pe-puppetmaster/public/ /var/opt/lib/pe-puppetmaster/public/tmp ${PLATFORM_PUPPET_HOME?}"
+        run_suppress_stdout "chown -R ${PLATFORM_PUPPET_USER}:${PLATFORM_PUPPET_GROUP} ${PLATFORM_PUPPET_HOME?} /var/log/pe-puppet/"
+
+        if [ -s '/etc/puppetlabs/httpd/conf.d/puppetmaster.conf' ] && ! ${PLATFORM_EGREP?} -q 'VirtualHost \*:8140' '/etc/puppetlabs/httpd/conf.d/puppetmaster.conf'; then
+            # We don't put this in conf.d, otherwise apache will try to load it and fail.
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/puppetmaster.conf.erb' > '/etc/puppetlabs/httpd/puppetmaster.conf.new'"
+
+            t_warn_about_puppetmaster_conf='y'
+        else
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/puppetmaster.conf.erb' > '/etc/puppetlabs/httpd/conf.d/puppetmaster.conf'"
+        fi
+
+        # Generate the master's SSL server certificate
+        if ! is_noop && [ ! -e "$(/opt/puppet/bin/puppet master --configprint hostcert)" ]; then
+            run_suppress_stdout "/opt/puppet/bin/puppet cert --generate ${q_puppetmaster_certname?} --dns_alt_names '${q_puppetmaster_dnsaltnames?}' --verbose --color=false|| true"
+        fi
+
+        # This is done to make sure that apache drops any X-Forwarded-For headers
+        # before passing them on to rack and passenger.
+
+        filebuffer_append "RequestHeader unset X-Forwarded-For"
+        filebuffer_write "/etc/puppetlabs/httpd/conf.d/headers.conf"
+
+        if [ ! -s "/etc/puppetlabs/puppet/console.conf" ]; then
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/puppetmaster_console.conf.erb' > '/etc/puppetlabs/puppet/console.conf'"
+        fi
+
+        if [ ! -e '/etc/puppetlabs/puppet/manifests/site.pp' ]; then
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/site.pp.erb' > '/etc/puppetlabs/puppet/manifests/site.pp'"
+        fi
+
+        # This is done to make it possible to trigger a license
+        # check during master startup from config.ru, invoked by Passenger, in the
+        # PE environment. To be removed when we insert a hook in Puppet to enable
+        # this more cleanly.
+        run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/config.ru.erb' > '/var/opt/lib/pe-puppetmaster/config.ru'"
+
+        # These files are not used by PE anymore, they can be safely removed
+        for file in send_cert_request.rb receive_signed_cert.rb; do
+            if [ -f "/opt/puppet/bin/${file}" ]; then
+                run_suppress_stdout "rm -f /opt/puppet/bin/${file}"
+            fi
+        done
+
+        # FIXME PACKAGING Should the packages set the permissions correctly?
+        run_suppress_stdout 'chown -R ${PLATFORM_PUPPET_USER}:${PLATFORM_PUPPET_GROUP} ${PLATFORM_PUPPET_HOME?} /var/opt/lib/pe-puppetmaster/ /var/log/pe-puppet/'
+    elif [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        # TODO Properly uninstall fake master
+        run "rm -f /etc/puppetlabs/httpd/conf.d/puppetmaster.conf"
+    fi
+
+    if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        # TODO Don't overwrite this
+        generate_global_passenger_conf
+    fi
+
+    display_comment 'Checking the agent certificate name detection...'
+    if run_suppress_stdout "/opt/puppet/bin/puppet agent --configprint certname --color=false"; then
+        if [ ! y = "${q_puppetmaster_install?}" ] && [ y = "${q_puppet_enterpriseconsole_install?}" -o y = "${q_puppetdb_install?}" -o y = "${q_puppet_agent_first_run:-"y"}" ] ; then
+          display_comment 'Setting up puppet agent...'
+          run_suppress_stdout "/opt/puppet/bin/puppet agent --test --color=false || true"
+        fi
+    else
+        display_failure 'The agent certificate name was incorrect; please check that your system can correctly resolve its own FQDN in DNS.'
+    fi
+
+    # If this is a master or console or puppetdb install, ignore the q_puppet_agent_first_run value
+    if is_pe_service_install || [ y = "${q_puppet_agent_first_run:-"y"}" ] ; then
+        # NONPORTABLE
+        case "${PLATFORM_NAME?}" in
+            amazon | centos | rhel | sles | aix | eos)
+                bounce_service 'pe-puppet'
+                enable_service 'pe-puppet'
+                ;;
+            ubuntu | debian | cumulus)
+                run "printf \"START=true\nDAEMON_OPTS=''\n\" > /etc/default/pe-puppet"
+                bounce_service 'pe-puppet'
+                enable_service 'pe-puppet'
+                ;;
+            solaris)
+                if [ "${PLATFORM_RELEASE?}" = "10" ] ; then
+                  if [ ! -d /etc/puppetlabs ]; then
+                      run_suppress_stdout "mkdir /etc/puppetlabs"
+                      run_suppress_stdout "chown ${PLATFORM_ROOT_USER}:${PLATFORM_ROOT_GROUP} /etc/puppetlabs"
+                      run_suppress_stdout "chmod 755 /etc/puppetlabs"
+                  fi
+                  run_suppress_stdout "/usr/sbin/svccfg import /var/svc/manifest/network/pe-puppet.xml"
+                  run_suppress_stdout "/usr/sbin/svcadm enable svc:/network/pe-puppet:default"
+                else
+                  # We deliver the manifest and puppet.conf as part of the
+                  # pe-puppet package on Solaris 11, so no need to create their
+                  # directories.  Service manifest import happens as part of
+                  # package installation, so we only need to enable it.
+                  run_suppress_stdout "/usr/sbin/svcadm enable svc:/network/pe-puppet:default"
+                fi
+                ;;
+            *)
+                display_failure "Do not know how to start puppet agent service on this platform"
+                ;;
+        esac
+    fi
+
+    # All of these roles need local copies of the modules
+    if is_pe_service_install; then
+        install_puppet_modules
+        # We just installed a bunch of modules, or upgraded them, which means
+        # we may have swapped out a bunch of parser functions that had
+        # already be loaded by pe-puppet (I'm looking at you, pe_accounts and
+        # create_resource). Removing the contents of the libdir will get rid
+        # of all the crufty functions, and pluginsync will repopulate it with
+        # new versions of the modules.
+        if is_upgrade; then
+          run_suppress_stdout "/opt/puppet/bin/puppet apply --exec \"Ini_setting { ensure => present, path => '/etc/puppetlabs/puppet/puppet.conf', section => main }\
+          ini_setting { 'server': setting => server, value => '${q_puppetagent_server?}' }\
+          ini_setting { 'certname': setting => certname, value => '${q_puppetagent_certname?}' }\""
+
+          if [ y = "${q_puppetmaster_install?}" ]; then
+              bounce_service 'pe-httpd'
+              wait_for_passenger 'upgrade'
+          fi
+
+          run_suppress_stdout "rm -rf `/opt/puppet/bin/puppet agent --configprint libdir`"
+          run_suppress_stdout "/opt/puppet/bin/puppet plugin download"
+        fi
+    fi
+    if is_upgrade; then
+        if [ y = "${q_puppetmaster_install?}" ]; then
+          display_comment 'Updating puppet.conf report processors'
+          run_suppress_stdout "/opt/puppet/bin/puppet resource ini_subsetting /etc/puppetlabs/puppet/puppet.conf path=/etc/puppetlabs/puppet/puppet.conf section=master setting=reports subsetting=https subsetting_separator=, ensure=absent"
+          run_suppress_stdout "/opt/puppet/bin/puppet resource ini_subsetting /etc/puppetlabs/puppet/puppet.conf path=/etc/puppetlabs/puppet/puppet.conf section=master setting=reports subsetting=http subsetting_separator=, ensure=absent"
+          run_suppress_stdout "/opt/puppet/bin/puppet resource ini_subsetting /etc/puppetlabs/puppet/puppet.conf path=/etc/puppetlabs/puppet/puppet.conf section=master setting=reports subsetting=console subsetting_separator=, ensure=present"
+          run_suppress_stdout "/opt/puppet/bin/puppet resource ini_setting /etc/puppetlabs/puppet/puppet.conf path=/etc/puppetlabs/puppet/puppet.conf section=master setting=reporturl ensure=absent"
+          display_comment 'Updating puppet.conf node terminus'
+          run_suppress_stdout "/opt/puppet/bin/puppet resource ini_setting /etc/puppetlabs/puppet/puppet.conf path=/etc/puppetlabs/puppet/puppet.conf section=master setting=node_terminus value=console"
+          run_suppress_stdout "/opt/puppet/bin/puppet resource ini_setting /etc/puppetlabs/puppet/puppet.conf path=/etc/puppetlabs/puppet/puppet.conf section=master setting=external_nodes ensure=absent"
+        fi
+    fi
+
+    if [ y = "${q_database_install?}" ]; then
+        display_comment 'Setting up the database...'
+
+        # Verify that we can set the password here.
+        configure_postgresql_server
+
+        # Set tablespace names & locations for use with the following erb
+        t_console_tablespace='pe-console'
+        t_console_tablespace_location='/opt/puppet/var/lib/pgsql/9.2/console'
+        t_puppetdb_tablespace='pe-puppetdb'
+        t_puppetdb_tablespace_location='/opt/puppet/var/lib/pgsql/9.2/puppetdb'
+
+        export t_console_tablespace
+        export t_console_tablespace_location
+        export t_puppetdb_tablespace
+        export t_puppetdb_tablespace_location
+
+        # Create tablespace folders
+        create_tablespace_folder ${t_console_tablespace_location?} "pe-postgres" "pe-postgres"
+        create_tablespace_folder ${t_puppetdb_tablespace_location?} "pe-postgres" "pe-postgres"
+
+        # Postgres will be restarted when we configure it, so make sure to wait
+        # until it's running. Unless we're running noop, in which case it's not
+        # installed so we can't wait for it.
+        if ! is_noop && ! wait_for_db 20; then
+            display_failure "The PostgreSQL server failed to start; unable to proceed"
+        fi
+
+        if !(is_upgrade && is_PE_x_or_greater '3'); then
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/databases.erb' | su - ${q_database_root_user} -c ${t_path_to_psql?} -s /bin/bash"
+        fi
+
+        # Now we've created databases and users, so if we roll back, we should run it with the -d flag
+        ROLL_BACK_DBS='y'
+    fi
+
+    # If this is a fresh db install we should be setting the password to the desired password. If we are just setting the db up we
+    # have already verified the credentials so we should be able to just set up the dbs.
+    if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        display_comment 'Setting up the console...'
+        if !(is_upgrade && is_PE_x_or_greater '3'); then
+            #...[ database.yml ]....................................................
+
+            backup_file '/etc/puppetlabs/puppet-dashboard/database.yml'
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/database.yml.erb' > '/etc/puppetlabs/puppet-dashboard/database.yml'"
+        fi
+
+        #...[ settings.yml ]....................................................
+
+        # Generate the session key for settings.yml
+        t_session_key_dashboard=`dd if=/dev/urandom bs=4k count=512 2> /dev/null | sha512sum  | $PLATFORM_AWK '{print $1}'`
+        export t_session_key_dashboard
+
+        if [ -s '/etc/puppetlabs/puppet-dashboard/settings.yml' ]; then
+            backup_file '/etc/puppetlabs/puppet-dashboard/settings.yml'
+            # Remove the old fake master settings
+            run "sed -i -e 's/inventory_server:.*/inventory_server: ${q_puppet_enterpriseconsole_master_hostname?}/' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+            run "sed -i -e 's/inventory_port:.*/inventory_port: 8140/' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+
+            # Add new settings if they don't exist
+            if ! ${PLATFORM_EGREP?} -q 'secret_token:' '/etc/puppetlabs/puppet-dashboard/settings.yml'; then
+                run "sed -i -e '\$i\\secret_token: ${t_session_key_dashboard?}' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+            fi
+
+            if ! ${PLATFORM_EGREP?} -q 'nodes_per_page:' '/etc/puppetlabs/puppet-dashboard/settings.yml'; then
+                run "sed -i -e '\$i\\nodes_per_page: 20' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+            fi
+            if ! ${PLATFORM_EGREP?} -q 'classes_per_page:' '/etc/puppetlabs/puppet-dashboard/settings.yml'; then
+                run "sed -i -e '\$i\\classes_per_page: 50' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+            fi
+            if ! ${PLATFORM_EGREP?} -q 'groups_per_page:' '/etc/puppetlabs/puppet-dashboard/settings.yml'; then
+                run "sed -i -e '\$i\\groups_per_page: 50' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+            fi
+            if ! ${PLATFORM_EGREP?} -q 'reports_per_page:' '/etc/puppetlabs/puppet-dashboard/settings.yml'; then
+                run "sed -i -e '\$i\\reports_per_page: 20' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+            fi
+            # Live Management Toggle settings
+            # If the LM variable doesn't exist in settings.yml, add it
+            # Otherwise, if the user has specified a desired state, change it to that
+            if ! ${PLATFORM_EGREP?} -q 'disable_live_management:' '/etc/puppetlabs/puppet-dashboard/settings.yml'; then
+                run "sed -i -e '\$i\\\n# Set this to true to disable Live Management on this node\n# If this is changed, you must restart pe-httpd' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+                if [ y = "${q_disable_live_management}" ]; then
+                    run "sed -i -e '\$i\\disable_live_management: true' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+                else
+                    run "sed -i -e '\$i\\disable_live_management: false' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+                fi
+            else
+                if [ y = "${q_disable_live_management}" ]; then
+                    run "sed -i -e 's/disable_live_management:.*/disable_live_management: true/' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+                elif [ n = "${q_disable_live_management}" ]; then
+                    run "sed -i -e 's/disable_live_management:.*/disable_live_management: false/' '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+                fi
+            fi
+        else
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/settings.yml.erb' > '/etc/puppetlabs/puppet-dashboard/settings.yml'"
+        fi
+
+        if !(is_upgrade && is_PE_x_or_greater '3'); then
+            # Generate the session key for cas_client_config.yml
+            t_session_key_cas=`dd if=/dev/urandom bs=4k count=512 2> /dev/null | sha512sum  | $PLATFORM_AWK '{print $1}'`
+            export t_session_key_cas
+
+            backup_file '/etc/puppetlabs/console-auth/database.yml'
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/console_auth_db_config.yml.erb' > '/etc/puppetlabs/console-auth/database.yml'"
+        fi
+
+        #TODO these ownership and permission fixes should also be put in the packages for console-auth
+        run "chmod 440 /etc/puppetlabs/console-auth/database.yml"
+        run "chown pe-auth:puppet-dashboard /etc/puppetlabs/console-auth/database.yml"
+
+        # If q_public_hostname is set by the answer file, use that. Otherwise,
+        # it defaults to the detected hostname, unless we're on EC2 in which
+        # case we use the public-hostname from the EC2 data.
+        if [ -z "${q_public_hostname}" ]; then
+            q_public_hostname="${PLATFORM_HOSTNAME?}"
+
+            # Get EC2 public-hostname for '/etc/puppetlabs/console-auth/config.yml' and '/etc/puppetlabs/rubycas-server/config.yml'
+            if [ ! -z $(run "/opt/puppet/bin/facter ec2_instance_id") ]; then
+                #  169.254.169.254 is used in Amazon EC2 to distribute metadata to cloud instances
+                q_public_hostname=$(run "curl -s http://169.254.169.254/latest/meta-data/public-hostname")
+            fi
+
+            export q_public_hostname
+        fi
+
+        # If the console auth configuration exists, back it up and then edit it.
+        if [ -s '/etc/puppetlabs/console-auth/config.yml' ]; then
+            backup_file '/etc/puppetlabs/console-auth/config.yml'
+
+            # Unconditionally delete the console_hostname key/value (PE = 3.0).
+            run "sed -i -e '/console_hostname:.*/d' '/etc/puppetlabs/console-auth/config.yml'"
+
+            # If the configuration doesn't have a console_absolute_url key/value, add one with the absolute URL to the console (PE >= 3.0.1).
+            if ! ${PLATFORM_EGREP?} -q 'console_absolute_url:' '/etc/puppetlabs/console-auth/config.yml'; then
+                run "sed -i -e '/authentication:/a\\  console_absolute_url: https://${q_public_hostname?}:${q_puppet_enterpriseconsole_httpd_port?}' '/etc/puppetlabs/console-auth/config.yml'"
+            fi
+
+            # If the configuration has a cas_url key/value, so we need to ensure it's a relative URL (PE >= 2.5.x).
+            # This was only an absolute URL in PE 3.0.
+            if ${PLATFORM_EGREP?} -q 'cas_url:' '/etc/puppetlabs/console-auth/config.yml'; then
+                run "sed -i -e 's/cas_url:.*/cas_url: \\/cas/' '/etc/puppetlabs/console-auth/config.yml'"
+
+            # The configuration doesn't contain a cas_url key/value, let's add one with the proper relative URL.
+            else
+                run "sed -i -e '/authentication:/a\\  cas_url: /cas' '/etc/puppetlabs/console-auth/config.yml'"
+            fi
+
+            # If the configuration doesn't have a service_url key/value, add one with the relative URL to the console (PE >= 3.0.1).
+            if ! ${PLATFORM_EGREP?} -q 'service_url:' '/etc/puppetlabs/console-auth/config.yml'; then
+                run "sed -i -e '/authentication:/a\\  service_url: /' '/etc/puppetlabs/console-auth/config.yml'"
+            fi
+
+            # If the configuration doesn't have a validate_url key/value, add one with the absolute URL to RubyCAS's endpoint on localhost (PE >= 3.0.1).
+            if ! ${PLATFORM_EGREP?} -q 'validate_url:' '/etc/puppetlabs/console-auth/config.yml'; then
+                run "sed -i -e '/authentication:/a\\  validate_url: https://localhost:${q_puppet_enterpriseconsole_httpd_port}/cas/proxyValidate' '/etc/puppetlabs/console-auth/config.yml'"
+            fi
+
+        # Otherwise just use the template.
+        else
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/console_auth_config.yml.erb' > '/etc/puppetlabs/console-auth/config.yml'"
+        fi
+
+        if ! run "${PLATFORM_EGREP?} -q 'log:' '/etc/puppetlabs/console-auth/config.yml'"; then
+            run "cat '${INSTALLER_DIR}/erb/console_auth_log_config.yml' >> '/etc/puppetlabs/console-auth/config.yml'"
+        fi
+
+
+        run "chmod 640 /etc/puppetlabs/console-auth/config.yml"
+        run "chown pe-auth:puppet-dashboard /etc/puppetlabs/console-auth/config.yml"
+
+        if (is_upgrade && is_PE_x_or_greater '3'); then
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/read_console_auth_db_config.erb' > '/etc/puppetlabs/rubycas-server/db_config.tmp'"
+            . '/etc/puppetlabs/rubycas-server/db_config.tmp'
+            export q_puppet_enterpriseconsole_auth_database_name q_puppet_enterpriseconsole_auth_database_user q_puppet_enterpriseconsole_auth_database_password
+            export q_database_host q_database_port
+            run_suppress_output "rm -f /etc/puppetlabs/rubycas-server/db_config.tmp"
+        fi
+
+        # The install package lays down an empty config.yml, so we need to make sure it's not zero size too
+        if [ -s '/etc/puppetlabs/rubycas-server/config.yml' ]; then
+            backup_file '/etc/puppetlabs/rubycas-server/config.yml'
+            # Our erb template reads this file, so we have to write to a tmp or
+            # we'll blow it away before reading.
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/rewrite_rubycas_config.yml.erb' > '/etc/puppetlabs/rubycas-server/config.yml.tmp'"
+            run "mv '/etc/puppetlabs/rubycas-server/config.yml.tmp' '/etc/puppetlabs/rubycas-server/config.yml'"
+        else
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/rubycas_config.yml.erb' > '/etc/puppetlabs/rubycas-server/config.yml'"
+        fi
+
+        run "chmod 600 /etc/puppetlabs/rubycas-server/config.yml"
+        run "chown pe-auth:pe-auth /etc/puppetlabs/rubycas-server/config.yml"
+
+        # If the file exists, we want to make sure it doesn't have the old
+        # cas_host and cas_port settings, but otherwise leave it alone because
+        # it can be modified by users to add new authorization sources, and
+        # also it contains the session_secret.
+        if [ -s '/etc/puppetlabs/console-auth/cas_client_config.yml' ]; then
+            backup_file '/etc/puppetlabs/console-auth/cas_client_config.yml'
+            run "sed -i -e '/cas_port:.*/d' -e '/cas_host:.*/d' /etc/puppetlabs/console-auth/cas_client_config.yml"
+            if ! ${PLATFORM_EGREP?} -q '^[^#]*session_timeout:' '/etc/puppetlabs/console-auth/cas_client_config.yml'; then
+              run "sed -i -e '/authentication:/a\\  session_timeout: 1200' '/etc/puppetlabs/console-auth/cas_client_config.yml'"
+            fi
+        else
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/cas_client_config.yml.erb' > '/etc/puppetlabs/console-auth/cas_client_config.yml'"
+            run "chmod 640 '/etc/puppetlabs/console-auth/cas_client_config.yml'"
+            run "chown pe-auth:puppet-dashboard /etc/puppetlabs/console-auth/cas_client_config.yml"
+        fi
+
+        # Lay down the client certificate authorization file
+        # If the file exists, leave it alone because it can be modified by users
+        # to add new authorized certificates.
+        if [ -s '/etc/puppetlabs/console-auth/certificate_authorization.yml' ]; then
+            backup_file '/etc/puppetlabs/console-auth/certificate_authorization.yml'
+            # Additional certificates:
+            # - pe-internal-dashboard
+            cmd=" if /opt/puppet/bin/ruby -r yaml -e \"exit YAML.load_file('/etc/puppetlabs/console-auth/certificate_authorization.yml')['pe-internal-dashboard'].nil? ? 0 : 1\"; then "
+            cmd+="    echo -e 'pe-internal-dashboard:\n  role: read-write' >> '/etc/puppetlabs/console-auth/certificate_authorization.yml'; "
+            cmd+="fi"
+            run "${cmd}"
+        else
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/console_auth_certificate_authorization.yml.erb' > '/etc/puppetlabs/console-auth/certificate_authorization.yml'"
+            run "chmod 640 '/etc/puppetlabs/console-auth/certificate_authorization.yml'"
+            run "chown pe-auth:puppet-dashboard /etc/puppetlabs/console-auth/certificate_authorization.yml"
+        fi
+
+        #...[ event-inspector/config.yml ]....................................................
+
+        # Setup event inspector's config file. We don't support the user
+        # making changes to this, so it will always be overriden.
+        run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/event_inspector_config.yml.erb' > '/opt/puppet/share/event-inspector/config/config.yml'"
+
+        if ! [ -s "/opt/puppet/share/console/applications/licenses/config.yml" ]; then
+            run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/license_status_config.yml.erb' > '/opt/puppet/share/console/applications/licenses/config.yml'"
+        fi
+
+        # setup logging for console-auth
+        run "mkdir -p /var/log/pe-console-auth"
+        run "touch /var/log/pe-console-auth/cas.log"
+        run "touch /var/log/pe-console-auth/auth.log"
+        run "chmod 770 /var/log/pe-console-auth"
+        run "chmod 660 /var/log/pe-console-auth/auth.log"
+        run "touch /var/log/pe-console-auth/cas_client.log"
+        run "chmod 660 /var/log/pe-console-auth/cas_client.log"
+        run "chown -R pe-auth:puppet-dashboard /var/log/pe-console-auth"
+
+        # Ensure Ownership is correct for all the config.ru files
+        run "chown puppet-dashboard:puppet-dashboard /opt/puppet/share/live-management/config.ru"
+        run "chown pe-auth:pe-auth /opt/puppet/share/console-auth/config.ru"
+        run "chown pe-auth:pe-auth /opt/puppet/share/rubycas-server/config.ru"
+
+        if [ y = "${q_puppetmaster_install?}" ]; then
+            # only start the http service if we are a CA
+            # and can generate signed certs as a part of installation
+            bounce_service 'pe-httpd'
+            run_suppress_stdout "chown ${PLATFORM_ROOT_USER}:${PLATFORM_ROOT_GROUP} ${PLATFORM_PUPPET_HOME?}/lib"
+            # Enabled the second time pe-httpd is bounced
+        fi
+
+        if [ ! -e '/opt/puppet/share/puppet-dashboard/certs/pe-internal-dashboard.private_key.pem' ]; then
+            console_rake_task 'cert:create_key_pair'
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" ]; then
+            wait_for_passenger install
+        fi
+
+        if [ ! -e '/opt/puppet/share/puppet-dashboard/certs/pe-internal-dashboard.cert.pem' ]; then
+            # There's no way to tell whether or not we've already done a
+            # cert request, but if we have it's harmless to try again. The
+            # rake task will fail, however, so we just ignore the failure
+            # and move on.
+            console_rake_task 'cert:request' || :
+
+            # We autosign the Console certificates when console/master are split. Otherwise we need to sign it now.
+            if [ y = "${q_puppetmaster_install?}" ]; then
+                run_suppress_stdout '/opt/puppet/bin/puppet cert --sign pe-internal-dashboard --color=false' || :
+            fi
+
+            console_rake_task 'cert:retrieve'
+        fi
+
+        run_suppress_stdout 'chown -Rvf puppet-dashboard:puppet-dashboard /opt/puppet/share/puppet-dashboard/certs'
+
+        run "/opt/puppet/bin/erb -T - '${INSTALLER_DIR}/erb/puppetdashboard.conf.erb' > '/etc/puppetlabs/httpd/conf.d/puppetdashboard.conf'"
+
+        if [ y = "${q_database_install?}" ]; then
+            console_rake_task 'db:create'
+        fi
+
+        display "Performing Puppet dashboard database migration. This may take some time for larger databases..."
+        display_newline
+        console_rake_task 'db:migrate'
+
+        run_suppress_stdout 'chown -Rvf puppet-dashboard:puppet-dashboard /var/log/pe-puppet-dashboard/*'
+        # migrate console-auth schema
+        display "Performing Puppet console authentication database migration. This may take some time for larger databases..."
+        display_newline
+        console_auth_rake_task 'db:migrate'
+
+        if is_upgrade && is_console && [ y = "${q_database_transfer?}" ]; then
+            display_comment "Transferring the console databases from MySQL to PostgreSQL"
+
+            # the cron job will add group/classes/etc and give us a very sad time, so we need to disable it first
+            run "sed -i s/^/#/g /etc/cron.d/default-add-all-nodes"
+
+            # we need the target database to be migrated down to the same version as the source database
+
+            display_comment "Preparing for the migration of the console database..."
+            display_comment "Synchronizing source and target database versions to ${t_source_console_db_version?}..."
+
+            verbose_bundle_exec "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:migrate RAILS_ENV=production VERSION=${t_source_console_db_version?} PE_MYSQL_SYNC=true"
+
+            display_comment "Performing migration of the console database. This may take a while..."
+
+            verbose_bundle_exec "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:console:transfer RAILS_ENV=production TMPDIR=${t_transfer_console_tmp_dir?} SRC_DBNAME=${t_source_console_db_name?} SRC_USERNAME=${t_source_console_user_name?} SRC_HOST=${t_source_console_host?} SRC_PORT=${t_source_console_port?}"
+
+            # we need the target database to be migrated back to up-to-date version
+            display_comment "Migrating target console database to the latest version..."
+            verbose_bundle_exec "/opt/puppet/bin/rake -s -R '${INSTALLER_DIR}' -f /opt/puppet/share/puppet-dashboard/Rakefile db:migrate RAILS_ENV=production"
+
+            display_comment "Preparing for the migration of the console_auth database..."
+            display_comment "Synchronizing source and target database versions to ${t_source_console_auth_db_version?}..."
+
+            # Add the -I entry here so we can load progress_bar
+            verbose_bundle_exec "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:migrate RAILS_ENV=production VERSION=${t_source_console_auth_db_version?}"
+
+            display_comment "Performing migration of the console_auth database. This may take a while..."
+
+            verbose_bundle_exec "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:console_auth:transfer RAILS_ENV=production TMPDIR=${t_transfer_console_auth_tmp_dir?} SRC_DBNAME=${t_source_console_auth_db_name?} SRC_USERNAME=${t_source_console_auth_user_name?} SRC_HOST=${t_source_console_auth_host?} SRC_PORT=${t_source_console_auth_port?}"
+
+            # we need the target database to be migrated back to up-to-date version
+            display_comment "Migrating target console_auth database to the latest version..."
+            verbose_bundle_exec "/opt/puppet/bin/rake -s -I /opt/puppet/share/puppet-dashboard/lib -R '${INSTALLER_DIR}' -f /opt/puppet/share/console-auth/Rakefile db:migrate RAILS_ENV=production"
+
+            run "sed -i s/^#//g /etc/cron.d/default-add-all-nodes"
+        fi
+
+        if ! is_upgrade; then
+            console_auth_rake_task "db:create_user USERNAME='${q_puppet_enterpriseconsole_auth_user_email}' PASSWORD='${q_puppet_enterpriseconsole_auth_password}' ROLE='admin'"
+        fi
+    fi
+
+    if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        # Make the display text more specific.
+        if [ y = "${q_puppetmaster_install?}" -a y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            http_for_string='puppet master and console'
+        elif [ y = "${q_puppetmaster_install?}" ]; then
+            http_for_string='puppet master'
+        elif [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            http_for_string='puppet console'
+        fi
+
+        display_comment "Starting http server for ${http_for_string}."
+
+        # NONPORTABLE
+        case "${PLATFORM_NAME?}" in
+            ubuntu | debian)
+                # Ubuntu's "pe-httpd" can't cope with ".bak" files.
+                run_suppress_stdout "rm -rf /etc/puppetlabs/httpd/*/*.bak"
+                # Ubuntu's "pe-httpd" doesn't enable some important modules by default
+                run_suppress_stdout "/opt/puppet/sbin/a2enmod ssl headers authnz_ldap ldap"
+                # Need to munge the /etc/default/pe-puppet-dashboard-workers init file for sanity
+                [ -f '/etc/default/pe-puppet-dashboard-workers' ] && run_suppress_stdout "sed -i 's/### START=no/START=yes/g' /etc/default/pe-puppet-dashboard-workers"
+                ;;
+        esac
+
+        if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            bounce_service 'pe-memcached'
+            enable_service 'pe-memcached'
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" -o y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            # Start the http service if we are a CA
+            # and can generate signed certs as a part of installation
+            # or if we're an enterprise console with our certs automatically signed.
+            bounce_service 'pe-httpd'
+            enable_service 'pe-httpd'
+        fi
+
+        if [ y = "${q_puppetmaster_install?}" ]; then
+            # Pluginsync modules down so facts are immediately available
+            run_suppress_stdout "/opt/puppet/bin/puppet plugin download"
+            configure_certificate_manager
+
+            setup_package_repo
+        fi
+
+        if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+            run_suppress_stdout 'touch /var/log/pe-puppet-dashboard/certificate_manager.log'
+            run_suppress_stdout 'chown -Rvf puppet-dashboard:puppet-dashboard /var/log/pe-puppet-dashboard/*'
+            bounce_service 'pe-puppet-dashboard-workers'
+            enable_service 'pe-puppet-dashboard-workers'
+
+            # Create default group, add correct classes to it
+            console_rake_task 'defaultgroup:ensure_default_group'
+        fi
+    fi
+
+    # Configure MCollective (Mainly to generate RSA keys)
+    if [ y = "${q_puppetmaster_install?}" ]; then
+        configure_mcollective_master
+    fi
+
+    # On the PuppetDB node, this will configure PuppetDB itself. On a master or
+    # console, it will configure the terminus, etc.
+    if [ y = "${q_puppetdb_install?}" -o y = "${q_puppetmaster_install?}" ]; then
+        configure_puppetdb
+    fi
+
+    if [ y = "${q_puppet_enterpriseconsole_install?}" ]; then
+        classify_mcollective_roles
+        if !(is_upgrade && is_PE_x_or_greater '3'); then
+            # On a fresh install or upgrade from 2.8, we classify PuppetDB
+            configure_puppetdb_master_classes
+            configure_puppetdb_classes
+        else
+            # This will find all 'database_password' parameters on node
+            # class memberships, filter for those on class 'pe_puppetdb',
+            # and then destroy them.
+            console_rails_run "Parameter.find_all_by_key_and_parameterable_type('database_password', 'NodeClassMembership', :include => {:parameterable => :node_class}).select {|p| p.parameterable.node_class.name == 'pe_puppetdb'}.each(&:destroy)"
+
+            # This will find all classes named 'pe_postgresql', 'pe_puppetdb',
+            # or 'pe_puppetdb::master' and rename them to the '*::pe'
+            # equivalents. This may be replaced with PE-2459 in the future.
+            rename_console_class 'pe_postgresql'           'pe_postgresql::pe'
+            rename_console_class 'pe_puppetdb'             'pe_puppetdb::pe'
+            rename_console_class 'pe_puppetdb::master'     'pe_puppetdb::pe::master'
+
+            # We rename the pe_puppetdb::master to pe_puppetdb::pe::master first and
+            # then immediately to pe_puppetdb::master::config so that we handle both
+            # of the old names.
+            rename_console_class 'pe_puppetdb::pe::master' 'pe_puppetdb::master::config'
+        fi
+
+        # The pe_compliance class may have been leftover from upgrades in the
+        # past, so we need to make sure to remove it, since the module no
+        # longer exists.
+        remove_pe_compliance_class
+
+        # Classify the console with the puppet_enterprise::license class, to sync
+        # the license file from the master. This is necessary for proper
+        # behavior of the license app, so we do it unconditionally.
+        configure_license_class
+
+        # Classify the master with the pe_repo classes, only if this is a fresh
+        # install or an upgrade from less than 3.2. We won't enforce it on
+        # future upgrades because users may choose to unclassify the master
+        # with these classes and we want to respect that.
+        if ! is_upgrade || [[ "${CURRENT_PE_MAJOR}.${CURRENT_PE_MINOR}" < "3.2" ]]; then
+            configure_pe_repo_classes
+        fi
+
+        # Postgres could be restarted again after configuring PuppetDB, so we
+        # wait for it to come back up before proceeding to run rake tasks which
+        # modify the DB. If we're not noop.
+        if ! is_noop && ! wait_for_db 20; then
+            display_failure "The PostgreSQL server failed to start; unable to proceed"
+        fi
+
+        display 'Applying enqueued configurations...'
+        console_rake_task_run_registered
+        display 'All configurations were successfully applied!'
+    fi
+
+    if [ y = "${q_all_in_one_install?}" ] && wait_for_puppetdb 120 ; then
+      run_suppress_stdout "/opt/puppet/bin/puppet agent --test --color=false || true"
+    fi
+
+    #---[ Finish installation ]---------------------------------------------
+    cron_enable
+    run "/opt/puppet/bin/facter --puppet --yaml > /etc/puppetlabs/mcollective/facts.yaml"
+    run "chown ${PLATFORM_PUPPET_USER}:${PLATFORM_PUPPET_GROUP} /etc/puppetlabs/puppet/puppet.conf"
+    run "chmod 600 /etc/puppetlabs/puppet/puppet.conf"
+
+
+    if [ y = "${q_puppet_enterpriseconsole_install}" ]; then
+        if run_suppress_stdout "getent hosts ${q_public_hostname?}"; then
+            t_is_hostname_resolvable='y'
+        else
+            t_is_hostname_resolvable='n'
+        fi
+    fi
+
+    display_step 'DONE'
+    if is_upgrade; then
+        display 'Thanks for upgrading Puppet Enterprise!'
+    else
+        display 'Thanks for installing Puppet Enterprise!'
+    fi
+
+    display_newline
+
+    if [ ! y = "${q_all_in_one_install}" ] ; then
+        if is_upgrade ; then
+            t_upgrade_or_install="upgrade"
+        else
+            t_upgrade_or_install="installation"
+        fi
+
+        if [ y = "${q_puppetdb_install?}" ] ; then
+            echo "You have completed the ${t_upgrade_or_install?} of PuppetDB.  You should now complete your ${t_upgrade_or_install?} by installing or upgrading the Puppet Enterprise Console. See the documentation for more assistance: http://docs.puppetlabs.com/pe/latest" | display_wrapped_text
+            display_newline
+            display_newline
+
+        elif [ y = "${q_puppetmaster_install?}" ] ; then
+            if is_upgrade && is_PE_x_or_greater '3'; then
+                echo "You have completed the upgrade of the puppet master, you should now proceed to upgrade PuppetDB. See the documentation for further assistance: http://docs.puppetlabs.com/pe/latest The PuppetDB node MUST be upgraded prior to installing the Console." | display_wrapped_text
+            else
+                echo "You have completed the ${t_upgrade_or_install?} of the puppet master, you should now proceed to install PuppetDB on a unique node. See the documentation for further assistance: http://docs.puppetlabs.com/pe/latest The PuppetDB node MUST be installed prior to installing the Console." | display_wrapped_text
+            fi
+            display_newline
+            display_newline
+        fi
+    fi
+
+    echo "To learn more and get started using Puppet Enterprise, refer to the Puppet Enterprise Quick Start Guide (http://docs.puppetlabs.com/pe/latest/quick_start.html) and the Puppet Enterprise Deployment Guide (http://docs.puppetlabs.com/guides/deployment_guide/index.html)." | display_wrapped_text
+    display_newline
+    display_newline
+
+    # on an enterprise console install
+    if [ y = "${q_puppet_enterpriseconsole_install}" ]; then
+        # check to see if the hostname is resolvable
+        if [ n = "${t_is_hostname_resolvable?}" ]; then
+            # give an error message if not
+            display_newline
+            echo "We could not resolve the host at ${q_public_hostname?}. If this hostname is actually correct, no further action is needed and you can disregard further error messages. If it is not correct, you need to edit the 'console_absolute_url' setting in '/etc/puppetlabs/console-auth/config.yml' to reflect the correct hostname." | display_wrapped_text
+            display_newline
+        else
+            # and display the console URL otherwise
+            CONSOLE_URL="https://${q_public_hostname?}:${q_puppet_enterpriseconsole_httpd_port?}"
+            if [ '443' = "${q_puppet_enterpriseconsole_httpd_port?}" ]; then
+                CONSOLE_URL="https://${q_public_hostname?}"
+            fi
+            display "   The console can be reached at the following URI:"
+            display "    *  ${CONSOLE_URL?}"
+            display_newline
+        fi
+    fi
+
+    display_major_separator
+    display_newline
+    display_comment 'NOTES'
+    display_newline
+    if ! is_upgrade; then
+        echo 'Puppet Enterprise has been installed to "/opt/puppet," and its configuration files are located in "/etc/puppetlabs".' | display_wrapped_text
+        display_newline
+        display_newline
+    fi
+
+    if [ y = "${t_warn_about_puppetmaster_conf}" ]; then
+        echo "Preserved existing /etc/puppetlabs/httpd/conf.d/puppetmaster.conf; please manually incorporate changes from /etc/puppetlabs/httpd/conf.d/puppetmaster.conf.new" | display_wrapped_text
+        display_newline
+        display_newline
+    fi
+
+    if [ ! -z "${ANSWER_FILE_TO_SAVE?}" ]; then
+        echo "Answers from this session saved to '${ANSWER_FILE_TO_SAVE?}'" | display_wrapped_text
+        display_newline
+        if [ "y" = "${q_database_install}" ] ; then
+            echo 'In addition, auto-generated database users and passwords have been saved to "/etc/puppetlabs/installer/database_info.install"' | display_wrapped_text
+            display_newline
+            echo "!!! WARNING: Do not discard these files! All auto-generated database users and passwords have been saved in them. You will need this information to configure the console role during installation." | display_wrapped_text
+            display_newline
+        fi
+        display_newline
+    else
+        echo "!!! WARNING: An answer file could not be saved so, to prevent data loss, supplied and auto-generated database users' passwords have been saved to '/etc/puppetlabs/installer/database_info.install'. This file should be secured as soon as possible!" | display_wrapped_text
+        display_newline
+        display_newline
+    fi
+    # XXX Don't warn about ports for now. Too lazy to do anything about the console port.
+    if ! is_upgrade; then
+        warn_open_ports
+        display_newline
+    fi
+    display_minor_separator
+    display_newline
+
+    # Clean up the stuff we exported
+    unset q_public_hostname
+    # Get rid of the development.log
+    run "rm -f /var/log/pe-puppet-dashboard/development.log"
+
+    quit
+fi
+
+#===[ End ]=============================================================
+
+# vim: tabstop=4:softtabstop=4:shiftwidth=4:expandtab
