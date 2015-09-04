@@ -1,14 +1,12 @@
 #!/bin/bash
 
-# Source: commit 39d70cd5311e3e6d769affc52035a94ca728a1cc
-
 #===[ Variables ]=======================================================
 
 # Variables that hold lists of dirs, files, users, services to kill/remove
 t_pe_uninstall_dirs="/opt/puppet /var/opt/lib/pe-puppet /var/opt/lib/pe-puppetmaster /var/opt/cache/pe-puppet-dashboard /var/opt/puppet /var/log/pe-*"
 t_pe_purge_dirs="/etc/puppetlabs"
 t_pe_files="/etc/init.d/pe-* /var/run/pe-*/* /var/run/pe-* /var/lock/subsys/pe-* /var/lock/pe-*"
-t_pe_processes="puppetagent pe-puppet pe-puppet-agent pe-mcollective pe-httpd pe-activemq pe-memcached pe-dashboard-workers"
+t_pe_processes="puppetagent pe-puppet pe-puppet-agent pe-mcollective pe-httpd pe-activemq pe-memcached pe-puppet-dashboard-workers"
 t_pe_users_and_groups="pe-memcached pe-apache pe-puppet puppet-dashboard pe-activemq peadmin pe-mco"
 t_pe_packages_to_check='^pe-.*$'
 t_pe_symlinks="puppet facter puppet-module mco pe-man"
@@ -100,7 +98,7 @@ handle_process() {
       PROC="-f /opt/puppet/sbin/mcollectived"
     ;;
 
-    pe-dashboard-workers)
+    pe-puppet-dashboard-workers)
       PROC="delayed_job"
     ;;
 
@@ -110,23 +108,21 @@ handle_process() {
     ;;
   esac
 
-  if [ "${1?}" = "pe-dashboard-workers" ]; then
+  if [ "${1?}" = "pe-puppet-dashboard-workers" ]; then
     # delayed_job is known to not respond well to service commands, so we'll try
     # using the init script, but we'll probably need to kill them.
     # delayed_job also doesn't appear in pgrep listings so `ps -ef` is also checked for delayed_job
-    if (! stop_process ${1?}) || (pgrep $PROC &> /dev/null) || (ps -ef | $PLATFORM_EGREP 'delayed_job\.[[:digit:]]*_monitor' &> /dev/null); then
-      PID="$(pgrep $PROC) $(ps -ef | $PLATFORM_EGREP 'delayed_job\.[[:digit:]]*_monitor' | awk '{ print $2 }' | xargs)"
-      PIDS=$(echo ${PID} | tr -d "\n")
-      if [ -n "${PIDS}" ]; then
+    if (! stop_process ${1?}) || [ -n "$(get_worker_pids)" ]; then
+      PID=$(get_worker_pids)
+      if [ -n "${PID}" ]; then
         for sig in "TERM" "KILL"; do
-          run "kill -${sig} ${PIDS?}"
+          run "kill -${sig} ${PID?}"
           sleep 3
-          PID="$(pgrep $PROC) $(ps -ef | $PLATFORM_EGREP 'delayed_job\.[[:digit:]]*_monitor' | awk '{ print $2 }' | xargs)"
-          PIDS=$(echo ${PID} | tr -d "\n")
+          PID=$(get_worker_pids)
           # Break out if there are no PIDs remaining to kill or if they are gone (aren't responding to signals, via kill -0)
           # kill -0 means do the processes respond to signals. this is linux specific but delayed_job and pe-puppet-dashboard
           # won't be on solaris, as solaris is agent only.
-          if [ -z "$PIDS" ] || ! (run "kill -0 ${PIDS} &> /dev/null"); then
+          if [ -z "$PID" ] || ! (run "kill -0 ${PID} &> /dev/null"); then
             break
           fi
         done
@@ -140,6 +136,16 @@ handle_process() {
     fi
   fi
 
+}
+
+#...[ Get Worker PIDS ]...............................................
+# Wrapper to make the script more readable. This should return the pids for the pe-puppet-dashboard workers.
+#
+
+get_worker_pids() {
+    t_PID="$(pgrep $PROC) $(ps -fu puppet-dashboard &> /dev/null && ps -fu puppet-dashboard | $PLATFORM_EGREP 'delayed_job' | awk '{ print $2 }' | xargs)  $(ps -fu pe-puppet-dashboard &> /dev/null && ps -fu pe-puppet-dashboard | $PLATFORM_EGREP 'delayed_job' | awk '{ print $2 }' | xargs)"
+    r_PID=$(echo ${t_PID} | tr -d "\n")
+    echo ${r_PID}
 }
 
 #...[ Stop process ]..................................................
@@ -232,8 +238,16 @@ remove_pe_packages() {
   # NONPORTABLE
   case "${PLATFORM_PACKAGING?}" in
     rpm)
-      packages_to_remove="$(rpm -qa | ${PLATFORM_EGREP?} ${t_pe_packages_to_check?} | xargs)"
+      # First pass, standard uninstall
+      packages_to_remove="$(rpm -qa --queryformat '%{NAME}\n' | ${PLATFORM_EGREP?} ${t_pe_packages_to_check?} | xargs)"
       command_to_remove_packages="rpm -e --allmatches ${packages_to_remove?}"
+      if [ -n "${packages_to_remove?}" ]; then
+        run "${command_to_remove_packages?}"
+      fi
+
+      # Some of the preun scriptlets break standard uninstall, so anything left standing needs to cleaned up.
+      packages_to_remove="$(rpm -qa --queryformat '%{NAME}\n' | ${PLATFORM_EGREP?} ${t_pe_packages_to_check?} | xargs)"
+      command_to_remove_packages="rpm -e --noscripts --allmatches ${packages_to_remove?}"
       if [ -n "${packages_to_remove?}" ]; then
         run "${command_to_remove_packages?}"
       fi
@@ -251,7 +265,7 @@ remove_pe_packages() {
       fi
     ;;
     pkgadd)
-      for pkg in "PUPopenssl PUPfacter PUPpuppet PUPruby PUPrubygems PUPstomp PUPmcollective PUPmoduletool"; do
+      for pkg in "PUPopenssl" "PUPfacter" "PUPpuppet" "PUPruby" "PUPrubygems" "PUPstomp" "PUPmcollective" "PUPmoduletool"; do
         if pkginfo | ${PLATFORM_EGREP?} -i "${pkg}"; then
           run "pkgrm -A -n ${pkg}"
         fi
@@ -396,7 +410,11 @@ display "Puppet Enterprise v$(cat "$(installer_dir)/VERSION") uninstaller"
 display_newline
 
 if is_remove_db; then
-  if [ -z "$q_pe_db_root_pass" ]; then
+  if ${PLATFORM_EGREP?} '^\s*host:\s*.*$' /etc/puppetlabs/puppet-dashboard/database.yml &> /dev/null && [ "$(get_db_field host)" != "localhost" ]; then
+    q_pe_remove_db=n
+    display "*** Warning: Your console databases appear to be remote. The uninstaller does not support remote database removal.\n\tAfter uninstalling, those databases and users should be manually removed if desired."
+    display_newline
+  elif [ -z "$q_pe_db_root_pass" ]; then
     display "In order to remove your console database user, we need to know the root password for mysql."
     ask q_pe_db_root_pass "What password does the 'root' user have on the database server?" StringOrBlank ""
   fi
@@ -411,7 +429,7 @@ else
 fi
 
 if is_remove_db; then
-  display '* Database(s) will be removed'
+  display '* Database(s) will be removed (note: the mysql package will not be removed)'
 fi
 
 if is_noop; then
@@ -497,7 +515,10 @@ if is_remove_db; then
       t_root_pass_string="-p${q_pe_db_root_pass}"
     fi
 
-    if eval "${t_mysql?} -u root ${t_root_pass_string} mysql -e \"SELECT * FROM user WHERE User='${t_pe_db_user?}' AND Host='localhost'\"" &> /dev/null; then
+    # Make sure the user exists. Count the results rows.
+    rows=`${t_mysql?} -u root ${t_root_pass_string} mysql -e "SELECT * FROM user WHERE User='${t_pe_db_user?}' AND Host='localhost'" 2> /dev/null | wc -l`
+
+    if [ $rows -gt 0 ]; then
       run "${t_mysql?} -u root ${t_root_pass_string} -e 'DROP USER \"${t_pe_db_user?}\"@\"localhost\"'"
     fi
   fi
@@ -545,13 +566,17 @@ done
 # Some package cleanup
 
 case "${PLATFORM_NAME?}" in
-  ubuntu)
+  ubuntu|debian)
     status "Removing stale dpkg state overrides..."
     sed -i '/^pe-puppet[[:space:]]/d' /var/lib/dpkg/statoverride
   ;;
 esac
 
 #===[ Teardown ]========================================================
+
+if is_remove_db; then
+  display "Your PE console user and databases have been removed. The mysql packages have not been removed. If you wish to remove mysql from your system, please use the appropriate commands for your package manager."
+fi
 
 unregister_exception_handler
 remove_workdir
