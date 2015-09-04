@@ -65,7 +65,7 @@ class cutover (
   file { "/tmp/chrismatteson-cutover/$uninstallver":
     ensure  => directory,
     recurse => true,
-    source  => "puppet:///cutover/$uninstallver",
+    source  => "puppet:///modules/cutover/$uninstallver",
     require => File['/tmp/chrismatteson-cutover'],
   }
 
