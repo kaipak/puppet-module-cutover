@@ -52,7 +52,7 @@ class cutover (
     cwd     => '/',
   }
 
-  file { '/tmp/chrismatteson-cutover':
+  file { ['/tmp/chrismatteson-cutover','/tmp/chrismatteson-cutover/PE','/tmp/chrismatteson-cutover/POSS']:
     ensure => directory,
   }
 
