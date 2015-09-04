@@ -3,14 +3,20 @@ class cutover (
 ) {
 
   case $::puppetversion {
-    '2.7.6 (Puppet Enterprise 2.0.0)':  { $uninstallver='2.0.0' }
-    '2.7.12 (Puppet Enterprise 2.5.0)': { $uninstallver='2.5.0' }
-    '3.7.0 (Puppet Enterprise 3.7.0)':  { $uninstallver='3.7.0' }
-    '3.7.2 (Puppet Enterprise 3.7.1)':  { $uninstallver='3.7.1' }
-    '3.7.2 (Puppet Enterprise 3.7.2)':  { $uninstallver='3.7.2' }
-    '3.8.0 (Puppet Enterprise 3.8.0)':  { $uninstallver='3.8.0' }
-    '3.8.1 (Puppet Enterprise 3.8.1)':  { $uninstallver='3.8.1' }
-    '3.8.2 (Puppet Enterprise 3.8.2)':  { $uninstallver='3.8.2' }
+    '2.7.6 (Puppet Enterprise 2.0.0)':  { $uninstallver='PE/2.0.0' }
+    '2.7.9 (Puppet Enterprise 2.0.1)':  { $uninstallver='PE/2.0.1' }
+    '2.7.9 (Puppet Enterprise 2.0.2)':  { $uninstallver='PE/2.0.2' }
+    '2.7.9 (Puppet Enterprise 2.0.3)':  { $uninstallver='PE/2.0.3' }
+    '2.7.12 (Puppet Enterprise 2.5.0)': { $uninstallver='PE/2.5.0' }
+    '2.7.12 (Puppet Enterprise 2.5.1)': { $uninstallver='PE/2.5.1' }
+    '2.7.12 (Puppet Enterprise 2.5.2)': { $uninstallver='PE/2.5.2' }
+    '2.7.12 (Puppet Enterprise 2.5.3)': { $uninstallver='PE/2.5.3' }
+    '3.7.0 (Puppet Enterprise 3.7.0)':  { $uninstallver='PE/3.7.0' }
+    '3.7.2 (Puppet Enterprise 3.7.1)':  { $uninstallver='PE/3.7.1' }
+    '3.7.2 (Puppet Enterprise 3.7.2)':  { $uninstallver='PE/3.7.2' }
+    '3.8.0 (Puppet Enterprise 3.8.0)':  { $uninstallver='PE/3.8.0' }
+    '3.8.1 (Puppet Enterprise 3.8.1)':  { $uninstallver='PE/3.8.1' }
+    '3.8.2 (Puppet Enterprise 3.8.2)':  { $uninstallver='PE/3.8.2' }
     default:                            { fail("Version $puppetversion is unsupported by this module") }
   }
 
