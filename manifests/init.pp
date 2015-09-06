@@ -133,9 +133,15 @@ class cutover (
       require => File['/tmp/chrismatteson-cutover/PE'],
     }
 
+    file { '/tmp/chrismatteson-cutover/cutover.sh':
+      ensure  => file,
+      content => template('cutover/cutover.sh.erb'),
+      require => File['/tmp/chrismatteson-cutover'],
+    }
+
     exec { 'cutover':
-      command => '/tmp/chrismatteson-cutover/<%= @uninstallver %>/puppet-enterprise-uninstaller -p -a /tmp/chrismatteson-cutover/<%= @uninstallver %>/answers.txt',
-      require => Exec['create installer'],
+      command => '/bin/bash /tmp/chrismatteson-cutover/cutover.sh',
+      require => [File['/tmp/chrismatteson-cutover/cutover.sh'],Exec['create installer']],
     }
   }
 }
