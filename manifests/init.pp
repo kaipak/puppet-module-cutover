@@ -43,12 +43,13 @@ class cutover (
     '3.8.0 (Puppet Enterprise 3.8.0)':  { $uninstallver='PE/3.8.0' }
     '3.8.1 (Puppet Enterprise 3.8.1)':  { $uninstallver='PE/3.8.1' }
     '3.8.2 (Puppet Enterprise 3.8.2)':  { $uninstallver='PE/3.8.2' }
+    '3.8.2':                            { $uninstallver='poss' }
     default:                            { fail("Version ${::puppetversion} is unsupported by this module") }
   }
 
   exec { 'create installer':
     command => "/bin/echo 'curl -k https://${new_master}:8140/packages/current/install.bash | sudo bash' | at now + 2 minutes",
-    require => File['/tmp/chrismatteson-cutover/cutover.sh',"/tmp/chrismatteson-cutover/${uninstallver}"],
+    require => File["/tmp/chrismatteson-cutover/${uninstallver}"],
     cwd     => '/',
   }
 
@@ -56,22 +57,27 @@ class cutover (
     ensure => directory,
   }
 
-  file { '/tmp/chrismatteson-cutover/cutover.sh':
-    ensure  => file,
-    content => template('cutover/cutover.sh.erb'),
-    require => File['/tmp/chrismatteson-cutover'],
-  }
-
   file { "/tmp/chrismatteson-cutover/${uninstallver}":
     ensure  => directory,
     recurse => true,
     source  => "puppet:///modules/cutover/${uninstallver}",
-    require => File['/tmp/chrismatteson-cutover'],
+    require => File['/tmp/chrismatteson-cutover/PE'],
   }
 
-  exec { 'cutover':
-    command => '/bin/bash /tmp/chrismatteson-cutover/cutover.sh',
-    require => Exec['create installer'],
+  if $uninstallver == 'poss' {
+    package { ['facter','hiera']:
+      ensure => 'absent',
+      before => Package['puppet'],
+    }
+    package { ['puppet']:
+      ensure  => 'absent',
+    }
+  }
+  else {
+    exec { 'cutover':
+      command => '/tmp/chrismatteson-cutover/<%= @uninstallver %>/puppet-enterprise-uninstaller -p -a /tmp/chrismatteson-cutover/<%= @uninstallver %>/answers.txt',
+      require => Exec['create installer'],
+    }
   }
 }
 
