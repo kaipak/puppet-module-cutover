@@ -1,6 +1,6 @@
 {
   "name": "chrismatteson-cutover",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Chris Matteson",
   "summary": "Uninstalls existing puppet agent, and runs simplified installer for cutover upgrades.",
   "license": "Apache Version 2.0",
