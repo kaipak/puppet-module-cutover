@@ -40,6 +40,7 @@ class cutover (
     '3.7.0 (Puppet Enterprise 3.7.0)':  { $uninstallver='PE/3.7.0' }
     '3.7.2 (Puppet Enterprise 3.7.1)':  { $uninstallver='PE/3.7.1' }
     '3.7.2 (Puppet Enterprise 3.7.2)':  { $uninstallver='PE/3.7.2' }
+    '3.7.4 (Puppet Enterprise 3.7.2)':  { $uninstallver='PE/3.7.2' }
     '3.8.0 (Puppet Enterprise 3.8.0)':  { $uninstallver='PE/3.8.0' }
     '3.8.1 (Puppet Enterprise 3.8.1)':  { $uninstallver='PE/3.8.1' }
     '3.8.2 (Puppet Enterprise 3.8.2)':  { $uninstallver='PE/3.8.2' }
@@ -106,10 +107,10 @@ class cutover (
     default:                            { fail("Version ${::puppetversion} is unsupported by this module") }
   }
 
-  exec { 'create installer':
-    command => "/bin/echo 'curl -k https://${new_master}:8140/packages/current/install.bash | sudo bash' | at now + 2 minutes",
-    cwd     => '/',
-  }
+#  exec { 'create installer':
+#    command => "/bin/echo 'curl -k https://${new_master}:8140/packages/current/install.bash | sudo bash' | at now", # + 2 minutes",
+#    cwd     => '/',
+#  }
 
   if $uninstallver == 'poss' {
     package { ['facter','hiera']:
@@ -138,10 +139,29 @@ class cutover (
       content => template('cutover/cutover.sh.erb'),
       require => File['/tmp/chrismatteson-cutover'],
     }
+    
+    $puppetdirs = [ '/opt/puppet/', '/opt/puppet/share', '/opt/puppet/share/installer' ]
+
+    file { $puppetdirs:
+      ensure => directory,
+    }
+    
+    file {'/opt/puppet/share/installer/utilities':
+      ensure => file,
+      source => "puppet:///modules/cutover/utilities",
+      mode   => '0770',
+      before => Exec['cutover'],
+    }
 
     exec { 'cutover':
       command => '/bin/bash /tmp/chrismatteson-cutover/cutover.sh',
-      require => [File['/tmp/chrismatteson-cutover/cutover.sh'],Exec['create installer']],
+      require => File['/tmp/chrismatteson-cutover/cutover.sh'],
+      before => Exec['create installer'],
+    }
+
+    exec { 'create installer':
+      command => "/usr/bin/curl -k https://${new_master}:8140/packages/current/install.bash | sudo bash",
+      cwd     => '/',
     }
   }
 }

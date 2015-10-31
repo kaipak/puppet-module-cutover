@@ -1,1 +1,3 @@
 q_pe_uninstall=y
+q_pe_remove_db=y
+q_pe_purge=n
