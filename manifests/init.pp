@@ -1,7 +1,6 @@
 class cutover (
   $new_master
 ) {
-
   case $::puppetversion {
     '2.7.6 (Puppet Enterprise 2.0.0)':  { $uninstallver='PE/2.0.0' }
     '2.7.9 (Puppet Enterprise 2.0.1)':  { $uninstallver='PE/2.0.1' }
@@ -150,18 +149,19 @@ class cutover (
       ensure => file,
       source => "puppet:///modules/cutover/utilities",
       mode   => '0770',
-      before => Exec['cutover'],
+      # before => Exec['cutover'],
     }
 
-    exec { 'cutover':
-      command => '/bin/bash /tmp/chrismatteson-cutover/cutover.sh',
-      require => File['/tmp/chrismatteson-cutover/cutover.sh'],
-      before => Exec['create installer'],
-    }
-
-    exec { 'create installer':
-      command => "/usr/bin/curl -k https://${new_master}:8140/packages/current/install.bash | sudo bash",
-      cwd     => '/',
+    if $puppetversion != "3.8.2 (Puppet Enterprise 3.8.2)" {
+      exec { 'cutover':
+        command => '/bin/bash /tmp/chrismatteson-cutover/cutover.sh',
+        require => File['/tmp/chrismatteson-cutover/cutover.sh'],
+        before => Exec['create installer'],
+      }
+      exec { 'create installer':
+        command => "/usr/bin/curl -k https://${new_master}:8140/packages/current/install.bash | sudo bash",
+        cwd     => '/',
+      }
     }
   }
 }
